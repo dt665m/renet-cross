@@ -1,0 +1,49 @@
+set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
+
+ROOT := justfile_directory() + "/.."
+EXAMPLES := justfile_directory()
+
+default:
+  @just --list
+
+# One-time setup for wasm builds.
+wasm-target:
+  rustup target add wasm32-unknown-unknown
+
+# Build the browser client bundle served by the server.
+web-build web_http_base="" web_webrtc_addr="":
+  cd "{{EXAMPLES}}/client" && \
+  NET_WEB_HTTP_BASE="{{web_http_base}}" \
+  NET_WEB_WEBRTC_ADDR="{{web_webrtc_addr}}" \
+  trunk build
+
+# Starts one server instance. mode=ui (default) or mode=headless.
+server mode="ui" log="server=debug,renet_server=debug,shared=debug,tower_http=debug,tracing::span=warn,bevy_render=warn,wgpu=warn,wgpu_core=warn,wgpu_hal=warn,naga=warn,info":
+  cd "{{ROOT}}" && \
+  RUST_LOG="{{log}}" \
+  RUST_LOG_SPAN_EVENTS=none \
+  RUST_BACKTRACE=1 \
+  cargo run -p server -- --mode "{{mode}}"
+
+# Convenience recipe to run the Bevy server with map/network debug UI.
+server-ui log="server=debug,renet_server=debug,shared=debug,tower_http=debug,tracing::span=warn,bevy_render=warn,wgpu=warn,wgpu_core=warn,wgpu_hal=warn,naga=warn,info":
+  just server mode="ui" log="{{log}}"
+
+# Starts one native desktop client instance using clap defaults.
+desktop-client log="client=info,renet=warn,renetcode=warn,info":
+  cd "{{ROOT}}" && RUST_LOG="{{log}}" RUST_BACKTRACE=1 cargo run -p client
+
+# Opens one browser client instance (run this again in another terminal for another tab/window).
+web-client url="http://127.0.0.1:8080" web_http_base="" web_webrtc_addr="":
+  cd "{{EXAMPLES}}/client" && \
+  NET_WEB_HTTP_BASE="{{web_http_base}}" \
+  NET_WEB_WEBRTC_ADDR="{{web_webrtc_addr}}" \
+  trunk build
+  if command -v open >/dev/null 2>&1; then \
+    open "{{url}}"; \
+  elif command -v xdg-open >/dev/null 2>&1; then \
+    xdg-open "{{url}}"; \
+  else \
+    echo "Open {{url}} in a browser."; \
+  fi
+  @echo "Tip: open browser devtools console to see wasm client logs."

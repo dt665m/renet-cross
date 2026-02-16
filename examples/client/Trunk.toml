@@ -1,0 +1,9 @@
+trunk-version = "^0.21"
+
+[build]
+target = "index.html"
+html_output = "index.html"
+dist = "dist"
+public_url = "/"
+filehash = true
+inject_scripts = true

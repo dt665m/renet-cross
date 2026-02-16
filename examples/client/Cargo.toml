@@ -1,0 +1,23 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { version = "0.18.0", default-features = true, features = ["bevy_dev_tools"] }
+bevy_feathers = "0.18.0"
+shared = { path = "../shared" }
+log = "0.4.22"
+renet = "2.0.0"
+renet_server = { package = "renet-server", path = "../.." }
+renetcode = "2.0.0"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+clap = { version = "4.5.53", features = ["derive", "env"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "json", "default-tls"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1.7"
+getrandom = { version = "0.2.17", features = ["js"] }
+wasm-bindgen-futures = "0.4.55"
+web-sys = { version = "0.3.82", features = ["Window", "Location"] }

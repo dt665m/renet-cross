@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Renet Server Demo</title>
+    <style>
+      :root {
+        --bg-top: #f4f8ff;
+        --bg-bottom: #dfe9ff;
+        --panel-bg: rgba(255, 255, 255, 0.82);
+        --panel-border: rgba(95, 120, 170, 0.28);
+        --text-main: #0f172a;
+        --text-muted: #35506f;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100svh;
+        padding: 18px 14px 24px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 14px;
+        background: linear-gradient(160deg, var(--bg-top), var(--bg-bottom));
+        color: var(--text-main);
+        font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
+      }
+
+      .hero {
+        width: min(96vw, 1080px);
+        border: 1px solid var(--panel-border);
+        background: var(--panel-bg);
+        border-radius: 14px;
+        padding: 12px 14px;
+        box-shadow: 0 10px 30px rgba(15, 23, 42, 0.1);
+      }
+
+      .hero h1 {
+        margin: 0;
+        font-size: clamp(16px, 2.4vw, 22px);
+        letter-spacing: 0.02em;
+      }
+
+      .hero p {
+        margin: 6px 0 0;
+        color: var(--text-muted);
+        font-size: clamp(12px, 1.7vw, 15px);
+      }
+
+      canvas {
+        display: block;
+        width: min(96vw, 1080px);
+        max-height: calc(100svh - 150px);
+        height: auto;
+        border-radius: 16px;
+        border: 1px solid rgba(100, 120, 168, 0.32);
+        box-shadow: 0 20px 48px rgba(15, 23, 42, 0.22);
+        touch-action: none;
+      }
+    </style>
+    <link data-trunk rel="rust" data-bin="client" />
+  </head>
+  <body>
+    <section class="hero">
+      <h1>Mixed Transport Multiplayer Demo</h1>
+      <p>Desktop: WASD / Arrow Keys. Mobile: drag anywhere to move.</p>
+    </section>
+  </body>
+</html>
