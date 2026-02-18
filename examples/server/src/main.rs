@@ -1,10 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     f32::consts::TAU,
-    net::{SocketAddr, UdpSocket},
+    net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
 use bevy::{
@@ -16,13 +16,14 @@ use bevy::{
 use clap::{Parser, ValueEnum};
 use renet::{ConnectionConfig, DefaultChannel, RenetServer, ServerEvent};
 use renet_server::{
-    MixedServerTransport, MonotonicClientIdAllocator, ServerAuthentication, ServerConfig,
-    Str0mNetcodeServerTransport, UdpNetcodeServerTransport,
+    BootstrapConfig, BootstrapService, MixedServerTransport, MixedTransportBuilder,
+    MonotonicClientIdAllocator, ServerAuthentication, UnsecureDevAuthPolicy,
 };
 use shared::{
-    BASE_PLAYER_MASS, BASE_PLAYER_SPEED, ClientInput, EntityKind, EntityState, FIXED_DT_SECONDS, JoinSnapshot,
-    PELLET_MASS, PLAYER_CONSUME_RATIO, RESPAWN_TICKS, TARGET_PELLET_COUNT, TICK_RATE_HZ, WORLD_HEIGHT, WORLD_WIDTH,
-    WorldDelta, WorldEvent, WorldState, decode, encode,
+    BASE_PLAYER_MASS, BASE_PLAYER_SPEED, ClientInput, EntityKind, EntityState, FIXED_DT_SECONDS,
+    JoinSnapshot, PELLET_MASS, PLAYER_CONSUME_RATIO, RESPAWN_TICKS, TARGET_PELLET_COUNT,
+    TICK_RATE_HZ, WORLD_HEIGHT, WORLD_WIDTH, WorldDelta, WorldEvent, WorldState, decode, encode,
+    is_newer_input_seq,
 };
 
 mod http_api;
@@ -35,7 +36,7 @@ const WORLD_BORDER_THICKNESS: f32 = 14.0;
 const CAMERA_MOVE_SPEED: f32 = 950.0;
 const CAMERA_BOOST_MULTIPLIER: f32 = 2.0;
 const INITIAL_ENTITY_ID: u64 = 1_000_000;
-const INPUT_STALE_TIMEOUT_TICKS: u32 = 5;
+const INPUT_STALE_TIMEOUT_TICKS: u32 = 3;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ServerMode {
@@ -68,78 +69,24 @@ struct ServerArgs {
     client_dist: PathBuf,
 }
 
-#[derive(Debug)]
-struct SessionRegistry {
-    pending: HashMap<u64, Instant>,
-    active: HashSet<u64>,
-    ttl: Duration,
-}
-
-impl SessionRegistry {
-    fn new(ttl: Duration) -> Self {
-        Self {
-            pending: HashMap::new(),
-            active: HashSet::new(),
-            ttl,
-        }
-    }
-
-    fn issue(&mut self, client_id: u64) {
-        self.cleanup();
-        self.pending.insert(client_id, Instant::now());
-    }
-
-    fn is_pending(&mut self, client_id: u64) -> bool {
-        self.cleanup();
-        self.pending.contains_key(&client_id)
-    }
-
-    fn activate(&mut self, client_id: u64) -> bool {
-        self.cleanup();
-        if self.pending.remove(&client_id).is_some() {
-            self.active.insert(client_id);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn deactivate(&mut self, client_id: u64) {
-        self.pending.remove(&client_id);
-        self.active.remove(&client_id);
-    }
-
-    fn cleanup(&mut self) {
-        let ttl = self.ttl;
-        self.pending.retain(|_, started| started.elapsed() <= ttl);
-    }
-}
-
 #[derive(Clone)]
 struct SharedNet {
-    sessions: Arc<Mutex<SessionRegistry>>,
+    bootstrap: Arc<BootstrapService<MonotonicClientIdAllocator, UnsecureDevAuthPolicy>>,
     server: Arc<Mutex<RenetServer>>,
     transport: Arc<Mutex<MixedServerTransport>>,
 }
 
 impl SharedNet {
     fn new(
-        sessions: Arc<Mutex<SessionRegistry>>,
+        bootstrap: Arc<BootstrapService<MonotonicClientIdAllocator, UnsecureDevAuthPolicy>>,
         server: Arc<Mutex<RenetServer>>,
         transport: Arc<Mutex<MixedServerTransport>>,
     ) -> Self {
         Self {
-            sessions,
+            bootstrap,
             server,
             transport,
         }
-    }
-
-    fn with_sessions<R>(&self, f: impl FnOnce(&mut SessionRegistry) -> R) -> Option<R> {
-        let Ok(mut sessions) = self.sessions.lock() else {
-            return None;
-        };
-        Some(f(&mut sessions))
     }
 
     fn with_server<R>(&self, f: impl FnOnce(&mut RenetServer) -> R) -> Option<R> {
@@ -147,13 +94,6 @@ impl SharedNet {
             return None;
         };
         Some(f(&mut server))
-    }
-
-    fn with_transport<R>(&self, f: impl FnOnce(&mut MixedServerTransport) -> R) -> Option<R> {
-        let Ok(mut transport) = self.transport.lock() else {
-            return None;
-        };
-        Some(f(&mut transport))
     }
 
     fn with_server_and_transport<R>(
@@ -307,7 +247,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } = args;
 
     let http_tls = match (http_tls_cert, http_tls_key) {
-        (Some(cert_path), Some(key_path)) => Some(HttpTlsConfig { cert_path, key_path }),
+        (Some(cert_path), Some(key_path)) => Some(HttpTlsConfig {
+            cert_path,
+            key_path,
+        }),
         (None, None) => None,
         (Some(_), None) => {
             return Err(std::io::Error::new(
@@ -326,7 +269,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let tls_enabled = http_tls.is_some();
     let http_bind = http_bind.unwrap_or_else(|| default_http_bind(tls_enabled));
-    let mut public_http_base = public_http_base.unwrap_or_else(|| default_public_http_base(http_bind, tls_enabled));
+    let mut public_http_base =
+        public_http_base.unwrap_or_else(|| default_public_http_base(http_bind, tls_enabled));
     if tls_enabled && public_http_base.starts_with("http://") {
         public_http_base = format!("https://{}", public_http_base.trim_start_matches("http://"));
     }
@@ -340,42 +284,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)?;
     let rng_seed = now.as_nanos() as u64;
 
-    let udp_socket = UdpSocket::bind(udp_bind)?;
-    let udp_transport = UdpNetcodeServerTransport::new(
-        ServerConfig {
-            current_time: now,
-            max_clients: 512,
-            protocol_id: PROTOCOL_ID,
-            public_addresses: vec![public_udp_addr],
-            authentication: ServerAuthentication::Unsecure,
-        },
-        udp_socket,
-    )?;
-
-    let webrtc_socket = UdpSocket::bind(webrtc_bind)?;
-    let webrtc_transport = Str0mNetcodeServerTransport::new(
-        ServerConfig {
-            current_time: now,
-            max_clients: 512,
-            protocol_id: PROTOCOL_ID,
-            public_addresses: vec![public_webrtc_addr],
-            authentication: ServerAuthentication::Unsecure,
-        },
-        webrtc_socket,
-    )?;
-
-    let sessions = Arc::new(Mutex::new(SessionRegistry::new(Duration::from_secs(120))));
     let server = Arc::new(Mutex::new(RenetServer::new(ConnectionConfig::default())));
-    let transport = Arc::new(Mutex::new(MixedServerTransport::new(udp_transport, webrtc_transport)));
-    let net = SharedNet::new(sessions, server, transport);
+    let transport = Arc::new(Mutex::new(
+        MixedTransportBuilder::new(PROTOCOL_ID)
+            .udp_bind(udp_bind)
+            .webrtc_bind(webrtc_bind)
+            .public_udp_addr(public_udp_addr)
+            .public_webrtc_addr(public_webrtc_addr)
+            .max_clients(512)
+            .authentication(ServerAuthentication::Unsecure)
+            .build()?,
+    ));
+    let bootstrap = Arc::new(BootstrapService::new(
+        BootstrapConfig {
+            session_ttl: Duration::from_secs(120),
+            public_udp_addr,
+            public_webrtc_addr,
+            public_http_base: public_http_base.clone(),
+        },
+        MonotonicClientIdAllocator::new(1),
+        UnsecureDevAuthPolicy,
+    ));
+    let net = SharedNet::new(bootstrap.clone(), server, transport.clone());
 
-    let app_state = AppState::new(
-        Arc::new(MonotonicClientIdAllocator::new(1)),
-        net.clone(),
-        public_udp_addr,
-        public_http_base,
-        public_webrtc_addr,
-    );
+    let app_state = AppState::new(bootstrap, transport, public_webrtc_addr);
 
     let _http_thread = spawn_http_server_thread(app_state, http_bind, client_dist, http_tls);
     run_bevy_server(mode, NetRuntime { net }, rng_seed);
@@ -412,9 +344,14 @@ fn run_bevy_server(mode: ServerMode, runtime: NetRuntime, rng_seed: u64) {
             .insert_resource(ClearColor(Color::srgb(0.02, 0.025, 0.04)))
             .insert_resource(SceneIndex::default())
             .add_systems(Startup, setup_ui_scene)
-            .add_systems(Update, server_camera_controls)
-            .add_systems(Update, sync_world_to_scene)
-            .add_systems(Update, update_network_panel);
+            .add_systems(
+                Update,
+                (
+                    server_camera_controls,
+                    sync_world_to_scene,
+                    update_network_panel,
+                ),
+            );
         }
     }
 
@@ -449,13 +386,8 @@ fn network_transport_update(
         while let Some(event) = server.get_event() {
             match event {
                 ServerEvent::ClientConnected { client_id } => {
-                    let accepted = runtime
-                        .net
-                        .with_sessions(|sessions| sessions.activate(client_id))
-                        .unwrap_or(false);
-
-                    if !accepted {
-                        log::warn!("disconnecting unauthorized client_id={client_id}");
+                    if let Err(err) = runtime.net.bootstrap.on_client_connected(client_id) {
+                        log::warn!("disconnecting unauthorized client_id={client_id}: {err}");
                         server.disconnect(client_id);
                         continue;
                     }
@@ -466,7 +398,7 @@ fn network_transport_update(
                     log::info!("client connected (pending authoritative spawn): {client_id}");
                 }
                 ServerEvent::ClientDisconnected { client_id, reason } => {
-                    let _ = runtime.net.with_sessions(|sessions| sessions.deactivate(client_id));
+                    runtime.net.bootstrap.on_client_disconnected(client_id);
 
                     if !auth_state.pending_disconnects.contains(&client_id) {
                         auth_state.pending_disconnects.push(client_id);
@@ -502,48 +434,13 @@ fn fixed_server_tick(world: &mut World) {
         }
 
         for client_id in server.clients_id() {
+            while let Some(bytes) =
+                server.receive_message(client_id, DefaultChannel::ReliableOrdered)
+            {
+                process_client_input_message(world, client_id, &bytes, input_tick);
+            }
             while let Some(bytes) = server.receive_message(client_id, DefaultChannel::Unreliable) {
-                match decode::<ClientInput>(&bytes) {
-                    Ok(input) => {
-                        let moving = input.move_dir[0].abs() > f32::EPSILON || input.move_dir[1].abs() > f32::EPSILON;
-                        if moving && input.seq % 5 == 0 {
-                            log::debug!(
-                                "server input client_id={} seq={} dir=[{:.2}, {:.2}]",
-                                client_id,
-                                input.seq,
-                                input.move_dir[0],
-                                input.move_dir[1]
-                            );
-                        }
-
-                        let seq = input.seq;
-                        let mut auth_state = world.resource_mut::<AuthoritativeState>();
-                        let is_newer = auth_state
-                            .last_input_seq
-                            .get(&client_id)
-                            .copied()
-                            .map_or(true, |last| is_newer_input_seq(seq, last));
-
-                        if is_newer {
-                            auth_state.last_input_seq.insert(client_id, seq);
-                            auth_state.last_input_tick.insert(client_id, input_tick);
-                            auth_state.inputs.insert(client_id, input);
-                        } else {
-                            log::trace!(
-                                "ignoring stale out-of-order input from client_id={} seq={} (latest={})",
-                                client_id,
-                                seq,
-                                auth_state.last_input_seq.get(&client_id).copied().unwrap_or(seq)
-                            );
-                        }
-                    }
-                    Err(err) => {
-                        log::debug!(
-                            "dropping invalid ClientInput from client_id={client_id}: {err} ({} bytes)",
-                            bytes.len()
-                        );
-                    }
-                }
+                process_client_input_message(world, client_id, &bytes, input_tick);
             }
         }
 
@@ -562,7 +459,7 @@ fn fixed_server_tick(world: &mut World) {
 
         let delta = build_world_delta(world, current_tick, events);
         if !(delta.upserts.is_empty() && delta.removed.is_empty() && delta.events.is_empty()) {
-            server.broadcast_message(DefaultChannel::Unreliable, encode(&delta));
+            send_world_delta_to_clients(world, server, &delta);
         }
 
         send_pending_join_snapshots(world, server, current_tick, &connected_clients);
@@ -570,7 +467,7 @@ fn fixed_server_tick(world: &mut World) {
         {
             let mut tick_counter = world.resource_mut::<ServerTickCounter>();
             tick_counter.0 = tick_counter.0.wrapping_add(1);
-            if tick_counter.0 % 100 == 0 {
+            if tick_counter.0.is_multiple_of(100) {
                 log::debug!(
                     "authoritative tick={} sim_tick={} connected_clients={}",
                     tick_counter.0,
@@ -590,6 +487,55 @@ fn take_pending_disconnects(world: &mut World) -> Vec<u64> {
     pending.sort_unstable();
     pending.dedup();
     pending
+}
+
+fn process_client_input_message(world: &mut World, client_id: u64, bytes: &[u8], input_tick: u32) {
+    match decode::<ClientInput>(bytes) {
+        Ok(input) => {
+            let moving =
+                input.move_dir[0].abs() > f32::EPSILON || input.move_dir[1].abs() > f32::EPSILON;
+            if moving && input.seq % 5 == 0 {
+                log::debug!(
+                    "server input client_id={} seq={} dir=[{:.2}, {:.2}]",
+                    client_id,
+                    input.seq,
+                    input.move_dir[0],
+                    input.move_dir[1]
+                );
+            }
+
+            let seq = input.seq;
+            let mut auth_state = world.resource_mut::<AuthoritativeState>();
+            let is_newer = auth_state
+                .last_input_seq
+                .get(&client_id)
+                .copied()
+                .is_none_or(|last| is_newer_input_seq(seq, last));
+
+            if is_newer {
+                auth_state.last_input_seq.insert(client_id, seq);
+                auth_state.last_input_tick.insert(client_id, input_tick);
+                auth_state.inputs.insert(client_id, input);
+            } else {
+                log::trace!(
+                    "ignoring stale out-of-order input from client_id={} seq={} (latest={})",
+                    client_id,
+                    seq,
+                    auth_state
+                        .last_input_seq
+                        .get(&client_id)
+                        .copied()
+                        .unwrap_or(seq)
+                );
+            }
+        }
+        Err(err) => {
+            log::debug!(
+                "dropping invalid ClientInput from client_id={client_id}: {err} ({} bytes)",
+                bytes.len()
+            );
+        }
+    }
 }
 
 fn take_pending_connects(world: &mut World) -> Vec<u64> {
@@ -626,13 +572,10 @@ fn handle_disconnect(world: &mut World, client_id: u64) {
     state.last_input_tick.remove(&client_id);
     state.last_input_seq.remove(&client_id);
     state.player_colors.remove(&client_id);
-    state.respawn_queue.retain(|entry| entry.client_id != client_id);
+    state
+        .respawn_queue
+        .retain(|entry| entry.client_id != client_id);
     state.pending_join_snapshots.retain(|id| *id != client_id);
-}
-
-fn is_newer_input_seq(candidate: u32, latest: u32) -> bool {
-    let delta = candidate.wrapping_sub(latest);
-    delta != 0 && delta < (u32::MAX / 2)
 }
 
 fn despawn_player_entities(world: &mut World, client_id: u64) {
@@ -714,7 +657,9 @@ fn process_respawns(
             continue;
         }
         spawn_player(world, client_id);
-        events.push(WorldEvent::PlayerRespawned { player_id: client_id });
+        events.push(WorldEvent::PlayerRespawned {
+            player_id: client_id,
+        });
     }
 }
 
@@ -802,7 +747,10 @@ fn consume_pellets(world: &mut World, events: &mut Vec<WorldEvent>) {
         return;
     }
 
-    let mut available: HashMap<u64, PelletSnapshot> = pellets.into_iter().map(|pellet| (pellet.id, pellet)).collect();
+    let mut available: HashMap<u64, PelletSnapshot> = pellets
+        .into_iter()
+        .map(|pellet| (pellet.id, pellet))
+        .collect();
     let mut mass_gain_by_player: HashMap<u64, f32> = HashMap::new();
     let mut consumed_records: Vec<(u64, PelletSnapshot)> = Vec::new();
 
@@ -1020,9 +968,26 @@ fn build_world_delta(world: &mut World, tick: u32, events: Vec<WorldEvent>) -> W
 
     WorldDelta {
         tick,
+        your_last_input_seq: None,
         upserts,
         removed,
         events,
+    }
+}
+
+fn send_world_delta_to_clients(world: &mut World, server: &mut RenetServer, delta: &WorldDelta) {
+    let input_acks = world
+        .resource::<AuthoritativeState>()
+        .last_input_seq
+        .clone();
+    for client_id in server.clients_id() {
+        let mut per_client_delta = delta.clone();
+        per_client_delta.your_last_input_seq = input_acks.get(&client_id).copied();
+        server.send_message(
+            client_id,
+            DefaultChannel::Unreliable,
+            encode(&per_client_delta),
+        );
     }
 }
 
@@ -1041,6 +1006,10 @@ fn send_pending_join_snapshots(
         tick,
         entities: collect_world_entities_sorted(world),
     };
+    let input_acks = world
+        .resource::<AuthoritativeState>()
+        .last_input_seq
+        .clone();
 
     for client_id in pending {
         if !connected_clients.contains(&client_id) {
@@ -1053,9 +1022,14 @@ fn send_pending_join_snapshots(
         let snapshot = JoinSnapshot {
             you: client_id,
             tick,
+            your_last_input_seq: input_acks.get(&client_id).copied(),
             world: world_state.clone(),
         };
-        server.send_message(client_id, DefaultChannel::ReliableOrdered, encode(&snapshot));
+        server.send_message(
+            client_id,
+            DefaultChannel::ReliableOrdered,
+            encode(&snapshot),
+        );
     }
 }
 
@@ -1186,7 +1160,10 @@ fn sync_world_to_scene(
     mut index: ResMut<SceneIndex>,
     mut visuals: Query<(&mut Transform, &mut Sprite), With<WorldVisualEntity>>,
 ) {
-    let mut world_entities: Vec<EntityState> = auth_entities.iter().map(|entity| entity.to_entity_state()).collect();
+    let mut world_entities: Vec<EntityState> = auth_entities
+        .iter()
+        .map(|entity| entity.to_entity_state())
+        .collect();
     world_entities.sort_unstable_by_key(|entity| entity.id);
 
     let mut seen = HashSet::with_capacity(world_entities.len());
@@ -1220,9 +1197,7 @@ fn spawn_visual_entity(commands: &mut Commands, state: &EntityState) -> Entity {
     let mut sprite = Sprite::default();
     let mut transform = Transform::default();
     apply_visual_state(state, &mut transform, &mut sprite);
-    commands
-        .spawn((sprite, transform, WorldVisualEntity))
-        .id()
+    commands.spawn((sprite, transform, WorldVisualEntity)).id()
 }
 
 fn apply_visual_state(state: &EntityState, transform: &mut Transform, sprite: &mut Sprite) {
@@ -1249,9 +1224,8 @@ fn update_network_panel(
         return;
     };
 
-    let Some((clients, total_up, total_down, total_rtt, total_loss, sampled, per_client_lines)) = runtime
-        .net
-        .with_server_and_transport(|server, transport| {
+    let Some((clients, total_up, total_down, total_rtt, total_loss, sampled, per_client_lines)) =
+        runtime.net.with_server_and_transport(|server, transport| {
             let mut clients = server.clients_id();
             clients.sort_unstable();
 
@@ -1399,9 +1373,7 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
 }
 
 fn rand_u32(rng_state: &mut u64) -> u32 {
-    *rng_state = rng_state
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1);
+    *rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
     (*rng_state >> 32) as u32
 }
 

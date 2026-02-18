@@ -1,6 +1,9 @@
-use std::{collections::{HashMap, HashSet}, f32::consts::TAU};
+use std::{
+    collections::{HashMap, HashSet},
+    f32::consts::TAU,
+};
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub const TICK_RATE_HZ: u32 = 30;
 pub const FIXED_DT_SECONDS: f32 = 1.0 / TICK_RATE_HZ as f32;
@@ -53,12 +56,14 @@ pub enum WorldEvent {
 pub struct JoinSnapshot {
     pub you: u64,
     pub tick: u32,
+    pub your_last_input_seq: Option<u32>,
     pub world: WorldState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorldDelta {
     pub tick: u32,
+    pub your_last_input_seq: Option<u32>,
     pub upserts: Vec<EntityState>,
     pub removed: Vec<u64>,
     pub events: Vec<WorldEvent>,
@@ -142,7 +147,8 @@ impl Simulation {
         self.players.remove(&client_id);
         self.player_colors.remove(&client_id);
         self.inputs.remove(&client_id);
-        self.respawn_queue.retain(|entry| entry.client_id != client_id);
+        self.respawn_queue
+            .retain(|entry| entry.client_id != client_id);
     }
 
     pub fn apply_input(&mut self, client_id: u64, input: ClientInput) {
@@ -154,6 +160,7 @@ impl Simulation {
         JoinSnapshot {
             you: client_id,
             tick: self.tick,
+            your_last_input_seq: self.inputs.get(&client_id).map(|input| input.seq),
             world: self.world_state(),
         }
     }
@@ -195,19 +202,31 @@ impl Simulation {
         }
         for client_id in due {
             self.ensure_player(client_id);
-            events.push(WorldEvent::PlayerRespawned { player_id: client_id });
+            events.push(WorldEvent::PlayerRespawned {
+                player_id: client_id,
+            });
         }
         self.respawn_queue = pending;
     }
 
     fn update_player_movement(&mut self) {
         for (client_id, player) in &mut self.players {
-            let dir = self.inputs.get(client_id).map(|input| normalize(input.move_dir)).unwrap_or([0.0, 0.0]);
+            let dir = self
+                .inputs
+                .get(client_id)
+                .map(|input| normalize(input.move_dir))
+                .unwrap_or([0.0, 0.0]);
 
             let speed = BASE_PLAYER_SPEED / (1.0 + player.mass * 0.015);
             player.vel = [dir[0] * speed, dir[1] * speed];
-            player.pos[0] = clamp_axis(player.pos[0] + player.vel[0] * FIXED_DT_SECONDS, WORLD_WIDTH);
-            player.pos[1] = clamp_axis(player.pos[1] + player.vel[1] * FIXED_DT_SECONDS, WORLD_HEIGHT);
+            player.pos[0] = clamp_axis(
+                player.pos[0] + player.vel[0] * FIXED_DT_SECONDS,
+                WORLD_WIDTH,
+            );
+            player.pos[1] = clamp_axis(
+                player.pos[1] + player.vel[1] * FIXED_DT_SECONDS,
+                WORLD_HEIGHT,
+            );
         }
     }
 
@@ -357,6 +376,7 @@ impl Simulation {
 
         WorldDelta {
             tick: self.tick,
+            your_last_input_seq: None,
             upserts,
             removed,
             events,
@@ -365,7 +385,10 @@ impl Simulation {
 
     fn rand_u32(&mut self) -> u32 {
         // Numerical Recipes LCG
-        self.rng_state = self.rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        self.rng_state = self
+            .rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1);
         (self.rng_state >> 32) as u32
     }
 
@@ -386,6 +409,11 @@ pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {
 
 pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, bincode::Error> {
     bincode::deserialize(bytes)
+}
+
+pub fn is_newer_input_seq(candidate: u32, latest: u32) -> bool {
+    let delta = candidate.wrapping_sub(latest);
+    delta != 0 && delta < (u32::MAX / 2)
 }
 
 fn radius_from_mass(mass: f32) -> f32 {
@@ -498,12 +526,13 @@ mod tests {
         }
 
         let delta = sim.step();
-        assert!(
-            delta
-                .events
-                .iter()
-                .any(|event| matches!(event, WorldEvent::PlayerConsumed { consumer_id: 10, consumed_id: 20 }))
-        );
+        assert!(delta.events.iter().any(|event| matches!(
+            event,
+            WorldEvent::PlayerConsumed {
+                consumer_id: 10,
+                consumed_id: 20
+            }
+        )));
     }
 
     #[test]

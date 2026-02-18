@@ -6,16 +6,16 @@ use std::{
 };
 
 use renet::{ClientId, RenetServer};
-use renetcode::{NetcodeServer, ServerConfig, NETCODE_MAX_PACKET_BYTES, NETCODE_USER_DATA_BYTES};
+use renetcode::{NETCODE_MAX_PACKET_BYTES, NETCODE_USER_DATA_BYTES, NetcodeServer, ServerConfig};
 use str0m::{
+    Event, IceConnectionState, Input, Output, Rtc,
     channel::ChannelId,
     net::{Protocol, Receive},
-    Event, IceConnectionState, Input, Output, Rtc,
 };
 
 use crate::{
-    netcode_result::{to_owned_server_result, OwnedServerResult},
     TransportError,
+    netcode_result::{OwnedServerResult, to_owned_server_result},
 };
 
 const WEBRTC_RECV_BUFFER_BYTES: usize = 65_535;
@@ -74,7 +74,7 @@ impl ServerPeer {
 }
 
 #[derive(Debug)]
-pub struct Str0mNetcodeServerTransport {
+pub struct WebRtcNetcodeServerTransport {
     socket: UdpSocket,
     netcode_server: NetcodeServer,
     receive_destination: SocketAddr,
@@ -96,7 +96,7 @@ fn virtual_addr_for_client(client_id: ClientId) -> SocketAddr {
     )
 }
 
-impl Str0mNetcodeServerTransport {
+impl WebRtcNetcodeServerTransport {
     pub fn new(server_config: ServerConfig, socket: UdpSocket) -> Result<Self, io::Error> {
         socket.set_nonblocking(true)?;
         let receive_destination = server_config
@@ -119,14 +119,17 @@ impl Str0mNetcodeServerTransport {
     }
 
     pub fn add_peer(&mut self, client_id: ClientId, rtc: Rtc) -> Option<ServerPeer> {
-        self.addr_to_client_id.retain(|_, value| *value != client_id);
+        self.addr_to_client_id
+            .retain(|_, value| *value != client_id);
         let peer = ServerPeer::new(client_id, rtc);
-        self.addr_to_client_id.insert(peer.virtual_addr(), client_id);
+        self.addr_to_client_id
+            .insert(peer.virtual_addr(), client_id);
         self.peers.insert(client_id, peer)
     }
 
     pub fn remove_peer(&mut self, client_id: ClientId) -> Option<ServerPeer> {
-        self.addr_to_client_id.retain(|_, value| *value != client_id);
+        self.addr_to_client_id
+            .retain(|_, value| *value != client_id);
         self.peers.remove(&client_id)
     }
 
@@ -163,7 +166,8 @@ impl Str0mNetcodeServerTransport {
     }
 
     pub fn time_since_last_received_packet(&self, client_id: ClientId) -> Option<Duration> {
-        self.netcode_server.time_since_last_received_packet(client_id)
+        self.netcode_server
+            .time_since_last_received_packet(client_id)
     }
 
     pub fn disconnect_all(&mut self, server: &mut RenetServer) {
@@ -174,7 +178,11 @@ impl Str0mNetcodeServerTransport {
         }
     }
 
-    pub fn update(&mut self, duration: Duration, server: &mut RenetServer) -> Result<(), TransportError> {
+    pub fn update(
+        &mut self,
+        duration: Duration,
+        server: &mut RenetServer,
+    ) -> Result<(), TransportError> {
         self.netcode_server.update(duration);
         let routed_results = self.route_socket_input_to_peers()?;
         for result in routed_results {
@@ -190,13 +198,15 @@ impl Str0mNetcodeServerTransport {
 
             let mut pending_server_results = Vec::new();
             if peer.rtc.is_alive() {
-                pending_server_results = self.drive_peer_with_limit(&mut peer, MAX_WEBRTC_DRAIN_STEPS_PER_PEER)?;
+                pending_server_results =
+                    self.drive_peer_with_limit(&mut peer, MAX_WEBRTC_DRAIN_STEPS_PER_PEER)?;
             }
 
             if peer.rtc.is_alive() {
                 self.peers.insert(client_id, peer);
             } else {
-                self.addr_to_client_id.retain(|_, value| *value != client_id);
+                self.addr_to_client_id
+                    .retain(|_, value| *value != client_id);
                 let result = self.netcode_server.disconnect(client_id);
                 let result = to_owned_server_result(result);
                 self.handle_server_result(result, server);
@@ -235,7 +245,10 @@ impl Str0mNetcodeServerTransport {
             };
 
             for packet in packets {
-                match self.netcode_server.generate_payload_packet(client_id, &packet) {
+                match self
+                    .netcode_server
+                    .generate_payload_packet(client_id, &packet)
+                {
                     Ok((_addr, payload)) => {
                         self.send_payload_scratch.clear();
                         self.send_payload_scratch.extend_from_slice(payload);
@@ -270,13 +283,15 @@ impl Str0mNetcodeServerTransport {
                 Ok((len, source)) => {
                     received_datagrams = received_datagrams.saturating_add(1);
                     datagrams_since_drain = datagrams_since_drain.saturating_add(1);
-                    let receive = match Receive::new(Protocol::Udp, source, destination, &self.buffer[..len]) {
-                        Ok(value) => value,
-                        Err(err) => {
-                            log::debug!("Ignoring non-str0m packet from {source}: {err}");
-                            continue;
-                        }
-                    };
+                    let receive =
+                        match Receive::new(Protocol::Udp, source, destination, &self.buffer[..len])
+                        {
+                            Ok(value) => value,
+                            Err(err) => {
+                                log::debug!("Ignoring non-webrtc packet from {source}: {err}");
+                                continue;
+                            }
+                        };
 
                     let input = Input::Receive(Instant::now(), receive);
 
@@ -293,7 +308,10 @@ impl Str0mNetcodeServerTransport {
                                 "dropping excess webRTC datagram for client {client_id} (per-update cap {MAX_WEBRTC_DATAGRAMS_PER_PEER_PER_UPDATE})"
                             );
                             if datagrams_since_drain >= WEBRTC_INGEST_MICRO_BATCH_SIZE {
-                                self.drain_touched_peers_round_robin(&mut touched_peers, &mut pending_server_results)?;
+                                self.drain_touched_peers_round_robin(
+                                    &mut touched_peers,
+                                    &mut pending_server_results,
+                                )?;
                                 datagrams_since_drain = 0;
                             }
                             continue;
@@ -319,11 +337,12 @@ impl Str0mNetcodeServerTransport {
                             self.addr_to_client_id.remove(&source);
                         }
 
-                        if queue_overflow {
-                            self.drain_touched_peers_round_robin(&mut touched_peers, &mut pending_server_results)?;
-                            datagrams_since_drain = 0;
-                        } else if datagrams_since_drain >= WEBRTC_INGEST_MICRO_BATCH_SIZE {
-                            self.drain_touched_peers_round_robin(&mut touched_peers, &mut pending_server_results)?;
+                        if queue_overflow || datagrams_since_drain >= WEBRTC_INGEST_MICRO_BATCH_SIZE
+                        {
+                            self.drain_touched_peers_round_robin(
+                                &mut touched_peers,
+                                &mut pending_server_results,
+                            )?;
                             datagrams_since_drain = 0;
                         }
                     } else {
@@ -345,10 +364,10 @@ impl Str0mNetcodeServerTransport {
     }
 
     fn resolve_client_for_input(&self, source: SocketAddr, input: &Input) -> Option<ClientId> {
-        if let Some(client_id) = self.addr_to_client_id.get(&source).copied() {
-            if self.peers.contains_key(&client_id) {
-                return Some(client_id);
-            }
+        if let Some(client_id) = self.addr_to_client_id.get(&source).copied()
+            && self.peers.contains_key(&client_id)
+        {
+            return Some(client_id);
         }
 
         self.peers.iter().find_map(|(client_id, peer)| {
@@ -378,7 +397,11 @@ impl Str0mNetcodeServerTransport {
         for offset in 0..count {
             let index = (start + offset) % count;
             let client_id = touched_peers[index];
-            self.drive_peer_with_budget(client_id, MAX_WEBRTC_DRAIN_STEPS_PER_PEER, pending_server_results)?;
+            self.drive_peer_with_budget(
+                client_id,
+                MAX_WEBRTC_DRAIN_STEPS_PER_PEER,
+                pending_server_results,
+            )?;
         }
 
         self.drain_round_robin_cursor = (start + 1) % count;
@@ -404,17 +427,14 @@ impl Str0mNetcodeServerTransport {
         if peer.rtc.is_alive() {
             self.peers.insert(client_id, peer);
         } else {
-            self.addr_to_client_id.retain(|_, value| *value != client_id);
+            self.addr_to_client_id
+                .retain(|_, value| *value != client_id);
             let result = self.netcode_server.disconnect(client_id);
             pending_server_results.push(to_owned_server_result(result));
         }
 
         pending_server_results.extend(peer_results);
         Ok(())
-    }
-
-    fn drive_peer(&mut self, peer: &mut ServerPeer) -> Result<Vec<OwnedServerResult>, TransportError> {
-        self.drive_peer_with_limit(peer, usize::MAX)
     }
 
     fn drive_peer_with_limit(
@@ -435,9 +455,12 @@ impl Str0mNetcodeServerTransport {
             match peer.rtc.poll_output()? {
                 Output::Timeout(_) => break,
                 Output::Transmit(transmit) => {
-                    self.socket.send_to(&transmit.contents, transmit.destination)?;
+                    self.socket
+                        .send_to(&transmit.contents, transmit.destination)?;
                 }
-                Output::Event(event) => self.handle_peer_event(peer, event, &mut pending_server_results),
+                Output::Event(event) => {
+                    self.handle_peer_event(peer, event, &mut pending_server_results)
+                }
             }
         }
 
@@ -456,7 +479,7 @@ impl Str0mNetcodeServerTransport {
                     peer.data_channel = Some(channel_id);
                 }
                 log::info!(
-                    "str0m channel opened for client {}: id={channel_id:?} label={label}",
+                    "webrtc channel opened for client {}: id={channel_id:?} label={label}",
                     peer.client_id
                 );
             }
@@ -467,7 +490,7 @@ impl Str0mNetcodeServerTransport {
 
                 let source_addr = peer.virtual_addr();
                 log::trace!(
-                    "str0m channel data client_id={} bytes={} binary={}",
+                    "webrtc channel data client_id={} bytes={} binary={}",
                     peer.client_id,
                     data.data.len(),
                     data.binary
@@ -478,21 +501,20 @@ impl Str0mNetcodeServerTransport {
                 let result = to_owned_server_result(result);
                 pending_server_results.push(result);
             }
-            Event::IceConnectionStateChange(state) => match state {
-                IceConnectionState::Disconnected => {
+            Event::IceConnectionStateChange(state) => {
+                if state == IceConnectionState::Disconnected {
                     log::info!(
-                        "str0m ICE state {:?} for client {}, disconnecting peer",
+                        "webrtc ICE state {:?} for client {}, disconnecting peer",
                         state,
                         peer.client_id
                     );
                     peer.rtc.disconnect();
                 }
-                _ => {}
-            },
+            }
             Event::ChannelClose(channel_id) => {
                 if peer.data_channel == Some(channel_id) {
                     log::info!(
-                        "str0m channel closed for client {}: id={channel_id:?}; disconnecting peer",
+                        "webrtc channel closed for client {}: id={channel_id:?}; disconnecting peer",
                         peer.client_id
                     );
                     peer.rtc.disconnect();
@@ -509,7 +531,10 @@ impl Str0mNetcodeServerTransport {
                 if let Some(client_id) = self.addr_to_client_id.get(&addr).copied() {
                     self.send_to_peer_lossy(client_id, &payload);
                 } else {
-                    log::warn!("Netcode produced packet for unknown address {addr} (known_routes={})", self.addr_to_client_id.len());
+                    log::warn!(
+                        "Netcode produced packet for unknown address {addr} (known_routes={})",
+                        self.addr_to_client_id.len()
+                    );
                 }
             }
             OwnedServerResult::Payload { client_id, payload } => {
@@ -523,7 +548,9 @@ impl Str0mNetcodeServerTransport {
                 payload,
             } => {
                 if server.is_connected(client_id) {
-                    log::error!("Duplicate client_id {client_id} across transports. Rejecting new WebRTC connection.");
+                    log::error!(
+                        "Duplicate client_id {client_id} across transports. Rejecting new WebRTC connection."
+                    );
                     let disconnect = self.netcode_server.disconnect(client_id);
                     if let OwnedServerResult::ClientDisconnected {
                         payload: Some(disconnect_payload),
@@ -552,7 +579,8 @@ impl Str0mNetcodeServerTransport {
                     self.send_to_peer_lossy(client_id, &payload);
                 }
 
-                self.addr_to_client_id.retain(|_, value| *value != client_id);
+                self.addr_to_client_id
+                    .retain(|_, value| *value != client_id);
                 self.peers.remove(&client_id);
             }
         }
@@ -587,5 +615,7 @@ impl Str0mNetcodeServerTransport {
 }
 
 fn is_receive_queue_full_error(err: &str0m::RtcError) -> bool {
-    err.to_string().to_ascii_lowercase().contains("receive queue full")
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("receive queue full")
 }

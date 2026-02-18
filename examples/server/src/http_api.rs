@@ -1,19 +1,15 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
-
-use axum::{
-    extract::{Path, State},
-    response::{IntoResponse, Response},
-    routing::{get, post},
-    Json, Router,
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, Mutex},
 };
+
 use axum_server::tls_rustls::RustlsConfig;
 use renet_server::{
-    MonotonicClientIdAllocator, SdpHttpAnswerResponse, SdpHttpHookConfig, SdpHttpHookError, SdpHttpOfferRequest,
-    SessionCreateResponse, accept_offer_axum_json,
+    BootstrapAxumState, DefaultBootstrapService, MixedServerTransport, SdpHttpHookConfig,
+    bootstrap_router,
 };
 use tower_http::{services::ServeDir, trace::TraceLayer};
-
-use crate::SharedNet;
 
 #[derive(Clone)]
 pub(super) struct HttpTlsConfig {
@@ -23,47 +19,21 @@ pub(super) struct HttpTlsConfig {
 
 #[derive(Clone)]
 pub(super) struct AppState {
-    allocator: Arc<MonotonicClientIdAllocator>,
-    net: SharedNet,
-    public_udp_addr: SocketAddr,
-    public_http_base: String,
+    bootstrap: Arc<DefaultBootstrapService>,
+    transport: Arc<Mutex<MixedServerTransport>>,
     webrtc_candidate_addr: SocketAddr,
 }
 
 impl AppState {
     pub(super) fn new(
-        allocator: Arc<MonotonicClientIdAllocator>,
-        net: SharedNet,
-        public_udp_addr: SocketAddr,
-        public_http_base: String,
+        bootstrap: Arc<DefaultBootstrapService>,
+        transport: Arc<Mutex<MixedServerTransport>>,
         webrtc_candidate_addr: SocketAddr,
     ) -> Self {
         Self {
-            allocator,
-            net,
-            public_udp_addr,
-            public_http_base,
+            bootstrap,
+            transport,
             webrtc_candidate_addr,
-        }
-    }
-}
-
-#[derive(Debug)]
-enum ApiError {
-    UnknownSession { client_id: u64 },
-    Hook(SdpHttpHookError),
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        match self {
-            ApiError::UnknownSession { client_id } => {
-                let payload = serde_json::json!({
-                    "error": format!("unknown or expired session id: {client_id}")
-                });
-                (axum::http::StatusCode::NOT_FOUND, Json(payload)).into_response()
-            }
-            ApiError::Hook(err) => err.into_response(),
         }
     }
 }
@@ -89,27 +59,35 @@ pub(super) fn spawn_http_server_thread(
             };
 
             runtime.block_on(async move {
-                let app = Router::new()
-                    .route("/healthz", get(healthz))
-                    .route("/api/session/new", post(session_new))
-                    .route("/api/webrtc/offer/{client_id}", post(webrtc_offer))
+                let bootstrap_state = BootstrapAxumState {
+                    bootstrap: state.bootstrap,
+                    transport: state.transport,
+                    hook_config: SdpHttpHookConfig {
+                        local_candidate_addr: state.webrtc_candidate_addr,
+                    },
+                };
+
+                let app = bootstrap_router(bootstrap_state)
                     .fallback_service(ServeDir::new(client_dist))
-                    .layer(TraceLayer::new_for_http())
-                    .with_state(state);
+                    .layer(TraceLayer::new_for_http());
 
                 if let Some(tls) = http_tls {
-                    let tls_config =
-                        match RustlsConfig::from_pem_file(tls.cert_path.clone(), tls.key_path.clone()).await {
-                            Ok(config) => config,
-                            Err(err) => {
-                                log::error!(
-                                    "failed to load TLS cert/key cert_path={} key_path={}: {err}",
-                                    tls.cert_path.display(),
-                                    tls.key_path.display()
-                                );
-                                return;
-                            }
-                        };
+                    let tls_config = match RustlsConfig::from_pem_file(
+                        tls.cert_path.clone(),
+                        tls.key_path.clone(),
+                    )
+                    .await
+                    {
+                        Ok(config) => config,
+                        Err(err) => {
+                            log::error!(
+                                "failed to load TLS cert/key cert_path={} key_path={}: {err}",
+                                tls.cert_path.display(),
+                                tls.key_path.display()
+                            );
+                            return;
+                        }
+                    };
 
                     log::info!("hybrid server listening on https://{http_bind}");
                     if let Err(err) = axum_server::bind_rustls(http_bind, tls_config)
@@ -135,73 +113,4 @@ pub(super) fn spawn_http_server_thread(
             });
         })
         .expect("failed to spawn dedicated HTTP thread")
-}
-
-async fn healthz() -> &'static str {
-    "ok"
-}
-
-async fn session_new(State(state): State<AppState>) -> Json<SessionCreateResponse> {
-    let client_id = state.allocator.next();
-    let _ = state.net.with_sessions(|sessions| sessions.issue(client_id));
-
-    let response = SessionCreateResponse {
-        client_id,
-        udp_addr: state.public_udp_addr.to_string(),
-        webrtc_addr: state.webrtc_candidate_addr.to_string(),
-        webrtc_offer_url: format!("{}/api/webrtc/offer/{client_id}", state.public_http_base),
-    };
-
-    log::info!(
-        "issued session client_id={} udp_addr={} webrtc_addr={} webrtc_offer_url={}",
-        response.client_id,
-        response.udp_addr,
-        response.webrtc_addr,
-        response.webrtc_offer_url
-    );
-
-    Json(response)
-}
-
-async fn webrtc_offer(
-    State(state): State<AppState>,
-    Path(client_id): Path<u64>,
-    Json(offer): Json<SdpHttpOfferRequest>,
-) -> Result<Json<SdpHttpAnswerResponse>, ApiError> {
-    log::debug!(
-        "received SDP offer client_id={} sdp_bytes={}",
-        client_id,
-        offer.sdp.len()
-    );
-
-    let known_session = state
-        .net
-        .with_sessions(|sessions| sessions.is_pending(client_id))
-        .unwrap_or(false);
-
-    if !known_session {
-        log::warn!("rejecting offer for unknown/expired client_id={client_id}");
-        return Err(ApiError::UnknownSession { client_id });
-    }
-
-    let answer = state
-        .net
-        .with_transport(|transport| {
-            accept_offer_axum_json(
-                transport.webrtc_mut(),
-                client_id,
-                offer,
-                SdpHttpHookConfig {
-                    local_candidate_addr: state.webrtc_candidate_addr,
-                },
-            )
-        })
-        .ok_or_else(|| {
-            log::error!("failed to lock transport state for client_id={client_id}");
-            ApiError::UnknownSession { client_id }
-        })?
-        .map_err(ApiError::Hook)?;
-
-    log::info!("accepted SDP offer for client_id={client_id}");
-    Ok(answer)
 }

@@ -6,8 +6,8 @@ use std::{
 
 use renet::{ConnectionConfig, DefaultChannel, RenetServer, ServerEvent};
 use renet_server::{
-    MixedServerTransport, NetcodeError, ServerAuthentication, ServerConfig, Str0mNetcodeServerTransport,
-    UdpNetcodeServerTransport, Rtc,
+    MixedServerTransport, NetcodeError, Rtc, ServerAuthentication, ServerConfig,
+    UdpNetcodeServerTransport, WebRtcNetcodeServerTransport,
 };
 
 const PROTOCOL_ID: u64 = 7;
@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         udp_socket,
     )?;
 
-    let webrtc_transport = Str0mNetcodeServerTransport::new(
+    let webrtc_transport = WebRtcNetcodeServerTransport::new(
         ServerConfig {
             current_time: now,
             max_clients: 128,
@@ -76,7 +76,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // 4) Authoritative game logic.
         for client_id in server.clients_id() {
-            while let Some(message) = server.receive_message(client_id, DefaultChannel::ReliableOrdered) {
+            while let Some(message) =
+                server.receive_message(client_id, DefaultChannel::ReliableOrdered)
+            {
                 let text = String::from_utf8_lossy(&message);
                 println!("{client_id}: {text}");
                 server.broadcast_message(DefaultChannel::ReliableOrdered, message);

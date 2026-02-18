@@ -17,7 +17,7 @@ pub enum TransportError {
     DataChannelNotOpen { client_id: ClientId },
     #[error("data channel backpressure for client {client_id}")]
     DataChannelBackpressure { client_id: ClientId },
-    #[error("no registered str0m peer for client {client_id}")]
+    #[error("no registered webrtc peer for client {client_id}")]
     MissingPeer { client_id: ClientId },
 }
 

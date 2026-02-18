@@ -2,16 +2,16 @@ use std::time::Duration;
 
 use renet::RenetServer;
 
-use crate::{Str0mNetcodeServerTransport, TransportError, UdpNetcodeServerTransport};
+use crate::{TransportError, UdpNetcodeServerTransport, WebRtcNetcodeServerTransport};
 
 #[derive(Debug)]
 pub struct MixedServerTransport {
     udp: UdpNetcodeServerTransport,
-    webrtc: Str0mNetcodeServerTransport,
+    webrtc: WebRtcNetcodeServerTransport,
 }
 
 impl MixedServerTransport {
-    pub fn new(udp: UdpNetcodeServerTransport, webrtc: Str0mNetcodeServerTransport) -> Self {
+    pub fn new(udp: UdpNetcodeServerTransport, webrtc: WebRtcNetcodeServerTransport) -> Self {
         Self { udp, webrtc }
     }
 
@@ -23,11 +23,11 @@ impl MixedServerTransport {
         &mut self.udp
     }
 
-    pub fn webrtc(&self) -> &Str0mNetcodeServerTransport {
+    pub fn webrtc(&self) -> &WebRtcNetcodeServerTransport {
         &self.webrtc
     }
 
-    pub fn webrtc_mut(&mut self) -> &mut Str0mNetcodeServerTransport {
+    pub fn webrtc_mut(&mut self) -> &mut WebRtcNetcodeServerTransport {
         &mut self.webrtc
     }
 
@@ -36,7 +36,11 @@ impl MixedServerTransport {
         self.webrtc.disconnect_all(server);
     }
 
-    pub fn update(&mut self, duration: Duration, server: &mut RenetServer) -> Result<(), TransportError> {
+    pub fn update(
+        &mut self,
+        duration: Duration,
+        server: &mut RenetServer,
+    ) -> Result<(), TransportError> {
         self.udp.update(duration, server)?;
         self.webrtc.update(duration, server)?;
         Ok(())

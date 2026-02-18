@@ -13,6 +13,5 @@ shared = { path = "../shared" }
 log = "0.4.22"
 renet = "2.0.0"
 renet_server = { package = "renet-server", path = "../..", features = ["axum"] }
-serde_json = "1.0.145"
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "time", "net"] }
 tower-http = { version = "0.6.6", features = ["fs", "trace"] }

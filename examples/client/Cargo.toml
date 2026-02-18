@@ -14,7 +14,6 @@ renetcode = "2.0.0"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 clap = { version = "4.5.53", features = ["derive", "env"] }
-reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "json", "default-tls"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1.7"

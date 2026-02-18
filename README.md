@@ -6,6 +6,85 @@ This bootstrap demonstrates one authoritative game server that accepts:
 
 The game loop and authority are shared, with one `RenetServer` and one `MixedServerTransport` (`udp + webrtc`).
 
+## Use With `renet` (Recommended)
+
+This crate intentionally does **not** re-export `renet`. Users should depend on both crates directly:
+
+```toml
+[dependencies]
+renet = "2"
+renet-server = "0.1"
+```
+
+### Server setup helper
+
+```rust
+use std::{net::SocketAddr, time::Duration};
+
+use renet::{ConnectionConfig, RenetServer, ServerEvent};
+use renet_server::{
+    BootstrapConfig, BootstrapService, MixedTransportBuilder, MonotonicClientIdAllocator,
+    ServerAuthentication, UnsecureDevAuthPolicy,
+};
+
+let protocol_id = 7;
+let mut server = RenetServer::new(ConnectionConfig::default());
+
+let mut transport = MixedTransportBuilder::new(protocol_id)
+    .udp_bind("0.0.0.0:5000".parse::<SocketAddr>()?)
+    .webrtc_bind("0.0.0.0:5001".parse::<SocketAddr>()?)
+    .public_udp_addr("127.0.0.1:5000".parse()?)
+    .public_webrtc_addr("127.0.0.1:5001".parse()?)
+    .max_clients(512)
+    .authentication(ServerAuthentication::Unsecure)
+    .build()?;
+
+let bootstrap = BootstrapService::new(
+    BootstrapConfig {
+        session_ttl: Duration::from_secs(120),
+        public_udp_addr: "127.0.0.1:5000".parse()?,
+        public_webrtc_addr: "127.0.0.1:5001".parse()?,
+        public_http_base: "http://127.0.0.1:8080".to_string(),
+    },
+    MonotonicClientIdAllocator::new(1),
+    UnsecureDevAuthPolicy,
+);
+
+// In your tick:
+// server.update(dt);
+// transport.update(dt, &mut server)?;
+// while let Some(event) = server.get_event() { match event { ... } }
+// transport.send_packets(&mut server);
+```
+
+### Native client setup helper
+
+```rust
+use std::time::Duration;
+
+use renet::RenetClient;
+use renet_server::{connect_via_session_http_blocking, NativeConnectOptions};
+
+let (mut client, mut transport, _client_id): (_, _, u64) =
+    connect_via_session_http_blocking(
+        "http://127.0.0.1:8080",
+        7,
+        NativeConnectOptions::default(),
+    )?;
+
+let dt = Duration::from_millis(16);
+client.update(dt);
+transport.update(dt, &mut client)?;
+transport.send_packets(&mut client)?;
+```
+
+### Axum helper (optional)
+
+With feature `axum`, use `bootstrap_router(...)` with your `BootstrapService` and `MixedServerTransport` to expose:
+- `GET /healthz`
+- `POST /api/session/new`
+- `POST /api/webrtc/offer/{client_id}`
+
 ## Architecture
 
 ```mermaid
@@ -42,7 +121,7 @@ flowchart LR
 ## HTTP and Signaling Flow
 
 1. `POST /api/session/new`
-- returns `SessionCreateResponse { client_id, udp_addr, webrtc_addr, webrtc_offer_url }`
+- returns `SessionCreateResponse { client_id, udp_addr, webrtc_addr, webrtc_offer_url, session_token? }`
 
 2. Browser only: `POST /api/webrtc/offer/{client_id}`
 - request: `{ "sdp": "...offer..." }`

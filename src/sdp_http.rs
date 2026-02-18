@@ -2,14 +2,9 @@ use std::{net::SocketAddr, time::Instant};
 
 use renet::ClientId;
 use serde::{Deserialize, Serialize};
-use str0m::{
-    change::SdpOffer,
-    error::IceError,
-    net::Protocol,
-    Candidate, Rtc, RtcError,
-};
+use str0m::{Candidate, Rtc, RtcError, change::SdpOffer, error::IceError, net::Protocol};
 
-use crate::Str0mNetcodeServerTransport;
+use crate::WebRtcNetcodeServerTransport;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SdpHttpHookConfig {
@@ -27,6 +22,8 @@ impl SdpHttpHookConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SdpHttpOfferRequest {
     pub sdp: String,
+    #[serde(default)]
+    pub session_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -48,7 +45,7 @@ pub enum SdpHttpHookError {
 }
 
 pub fn accept_offer_and_add_peer(
-    transport: &mut Str0mNetcodeServerTransport,
+    transport: &mut WebRtcNetcodeServerTransport,
     client_id: ClientId,
     offer: SdpHttpOfferRequest,
     config: SdpHttpHookConfig,
@@ -57,9 +54,10 @@ pub fn accept_offer_and_add_peer(
         return Err(SdpHttpHookError::DuplicateClientId { client_id });
     }
 
-    let offer = SdpOffer::from_sdp_string(&offer.sdp).map_err(|err| SdpHttpHookError::InvalidOffer {
-        message: err.to_string(),
-    })?;
+    let offer =
+        SdpOffer::from_sdp_string(&offer.sdp).map_err(|err| SdpHttpHookError::InvalidOffer {
+            message: err.to_string(),
+        })?;
 
     let mut rtc = Rtc::builder().build(Instant::now());
     let candidate = Candidate::host(config.local_candidate_addr, Protocol::Udp)?;
@@ -76,7 +74,7 @@ pub fn accept_offer_and_add_peer(
 
 #[cfg(feature = "axum")]
 pub fn accept_offer_axum_json(
-    transport: &mut Str0mNetcodeServerTransport,
+    transport: &mut WebRtcNetcodeServerTransport,
     client_id: ClientId,
     offer: SdpHttpOfferRequest,
     config: SdpHttpHookConfig,
@@ -88,7 +86,7 @@ pub fn accept_offer_axum_json(
 #[cfg(feature = "axum")]
 impl axum::response::IntoResponse for SdpHttpHookError {
     fn into_response(self) -> axum::response::Response {
-        use axum::{http::StatusCode, Json};
+        use axum::{Json, http::StatusCode};
 
         #[derive(Serialize)]
         struct ErrorBody {
@@ -101,7 +99,13 @@ impl axum::response::IntoResponse for SdpHttpHookError {
             SdpHttpHookError::Ice(_) | SdpHttpHookError::Rtc(_) => StatusCode::UNPROCESSABLE_ENTITY,
         };
 
-        (status, Json(ErrorBody { error: self.to_string() })).into_response()
+        (
+            status,
+            Json(ErrorBody {
+                error: self.to_string(),
+            }),
+        )
+            .into_response()
     }
 }
 
@@ -111,8 +115,10 @@ mod tests {
 
     use renetcode::{ServerAuthentication, ServerConfig};
 
-    use super::{accept_offer_and_add_peer, SdpHttpHookConfig, SdpHttpHookError, SdpHttpOfferRequest};
-    use crate::Str0mNetcodeServerTransport;
+    use super::{
+        SdpHttpHookConfig, SdpHttpHookError, SdpHttpOfferRequest, accept_offer_and_add_peer,
+    };
+    use crate::WebRtcNetcodeServerTransport;
 
     #[test]
     fn invalid_offer_is_rejected() {
@@ -125,13 +131,14 @@ mod tests {
             public_addresses: vec![addr],
             authentication: ServerAuthentication::Unsecure,
         };
-        let mut transport = Str0mNetcodeServerTransport::new(config, socket).expect("transport");
+        let mut transport = WebRtcNetcodeServerTransport::new(config, socket).expect("transport");
 
         let result = accept_offer_and_add_peer(
             &mut transport,
             1,
             SdpHttpOfferRequest {
                 sdp: "not sdp".to_string(),
+                session_token: None,
             },
             SdpHttpHookConfig::new(addr),
         );
@@ -150,7 +157,7 @@ mod tests {
             public_addresses: vec![addr],
             authentication: ServerAuthentication::Unsecure,
         };
-        let mut transport = Str0mNetcodeServerTransport::new(config, socket).expect("transport");
+        let mut transport = WebRtcNetcodeServerTransport::new(config, socket).expect("transport");
 
         // pre-register id
         let rtc = str0m::Rtc::builder().build(std::time::Instant::now());
@@ -161,10 +168,14 @@ mod tests {
             42,
             SdpHttpOfferRequest {
                 sdp: "v=0".to_string(),
+                session_token: None,
             },
             SdpHttpHookConfig::new(addr),
         );
 
-        assert!(matches!(result, Err(SdpHttpHookError::DuplicateClientId { client_id: 42 })));
+        assert!(matches!(
+            result,
+            Err(SdpHttpHookError::DuplicateClientId { client_id: 42 })
+        ));
     }
 }

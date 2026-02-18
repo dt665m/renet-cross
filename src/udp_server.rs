@@ -5,11 +5,11 @@ use std::{
 };
 
 use renet::{ClientId, RenetServer};
-use renetcode::{NetcodeServer, ServerConfig, NETCODE_MAX_PACKET_BYTES, NETCODE_USER_DATA_BYTES};
+use renetcode::{NETCODE_MAX_PACKET_BYTES, NETCODE_USER_DATA_BYTES, NetcodeServer, ServerConfig};
 
 use crate::{
-    netcode_result::{to_owned_server_result, OwnedServerResult},
     TransportError,
+    netcode_result::{OwnedServerResult, to_owned_server_result},
 };
 
 #[derive(Debug)]
@@ -56,7 +56,8 @@ impl UdpNetcodeServerTransport {
     }
 
     pub fn time_since_last_received_packet(&self, client_id: ClientId) -> Option<Duration> {
-        self.netcode_server.time_since_last_received_packet(client_id)
+        self.netcode_server
+            .time_since_last_received_packet(client_id)
     }
 
     pub fn disconnect_all(&mut self, server: &mut RenetServer) {
@@ -67,13 +68,19 @@ impl UdpNetcodeServerTransport {
         }
     }
 
-    pub fn update(&mut self, duration: Duration, server: &mut RenetServer) -> Result<(), TransportError> {
+    pub fn update(
+        &mut self,
+        duration: Duration,
+        server: &mut RenetServer,
+    ) -> Result<(), TransportError> {
         self.netcode_server.update(duration);
 
         loop {
             match self.socket.recv_from(&mut self.buffer) {
                 Ok((len, source)) => {
-                    let result = self.netcode_server.process_packet(source, &mut self.buffer[..len]);
+                    let result = self
+                        .netcode_server
+                        .process_packet(source, &mut self.buffer[..len]);
                     let result = to_owned_server_result(result);
                     self.handle_server_result(result, server);
                 }
@@ -110,10 +117,15 @@ impl UdpNetcodeServerTransport {
             };
 
             for packet in packets {
-                match self.netcode_server.generate_payload_packet(client_id, &packet) {
+                match self
+                    .netcode_server
+                    .generate_payload_packet(client_id, &packet)
+                {
                     Ok((addr, payload)) => {
                         if let Err(err) = self.socket.send_to(payload, addr) {
-                            log::debug!("Failed to send packet to client {client_id} ({addr}): {err}");
+                            log::debug!(
+                                "Failed to send packet to client {client_id} ({addr}): {err}"
+                            );
                             break;
                         }
                     }
@@ -145,7 +157,9 @@ impl UdpNetcodeServerTransport {
                 payload,
             } => {
                 if server.is_connected(client_id) {
-                    log::error!("Duplicate client_id {client_id} across transports. Rejecting new UDP connection.");
+                    log::error!(
+                        "Duplicate client_id {client_id} across transports. Rejecting new UDP connection."
+                    );
                     let disconnect = self.netcode_server.disconnect(client_id);
                     if let OwnedServerResult::ClientDisconnected {
                         payload: Some(disconnect_payload),
@@ -175,5 +189,4 @@ impl UdpNetcodeServerTransport {
             }
         }
     }
-
 }

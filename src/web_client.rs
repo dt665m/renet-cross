@@ -6,11 +6,12 @@ use gloo_timers::future::TimeoutFuture;
 use js_sys::{Array, ArrayBuffer, Reflect, Uint8Array};
 use renet::{ConnectionConfig, RenetClient};
 use renetcode::{ClientAuthentication, NetcodeClient, NetcodeError};
-use wasm_bindgen::{closure::Closure, JsCast, JsValue};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    MessageEvent, RtcDataChannel, RtcDataChannelInit, RtcDataChannelState, RtcDataChannelType, RtcIceGatheringState,
-    RtcConfiguration, RtcIceServer, RtcPeerConnection, RtcSdpType, RtcSessionDescriptionInit,
+    MessageEvent, RtcConfiguration, RtcDataChannel, RtcDataChannelInit, RtcDataChannelState,
+    RtcDataChannelType, RtcIceGatheringState, RtcIceServer, RtcPeerConnection, RtcSdpType,
+    RtcSessionDescriptionInit,
 };
 
 use crate::SessionCreateResponse;
@@ -24,12 +25,21 @@ pub enum WebRtcClientError {
     #[error("HTTP request to {url} failed: {detail}")]
     HttpRequest { url: String, detail: String },
     #[error("HTTP {status} from {url}: {body}")]
-    HttpStatus { url: String, status: u16, body: String },
+    HttpStatus {
+        url: String,
+        status: u16,
+        body: String,
+    },
     #[error("invalid JSON from {url}: {detail}")]
     HttpDecode { url: String, detail: String },
     #[error("invalid webrtc_addr in session response '{addr}': {source}")]
-    InvalidSessionWebRtcAddr { addr: String, source: AddrParseError },
-    #[error("session client_id ({session_client_id}) did not match answer client_id ({answer_client_id})")]
+    InvalidSessionWebRtcAddr {
+        addr: String,
+        source: AddrParseError,
+    },
+    #[error(
+        "session client_id ({session_client_id}) did not match answer client_id ({answer_client_id})"
+    )]
     ClientIdMismatch {
         session_client_id: u64,
         answer_client_id: u64,
@@ -51,6 +61,8 @@ pub enum WebRtcClientError {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SdpHttpOfferRequest {
     sdp: String,
+    #[serde(default)]
+    session_token: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -68,10 +80,16 @@ pub struct WebRtcNetcodeClientTransport {
 }
 
 impl WebRtcNetcodeClientTransport {
-    pub fn update(&mut self, duration: Duration, client: &mut RenetClient) -> Result<(), WebRtcClientError> {
+    pub fn update(
+        &mut self,
+        duration: Duration,
+        client: &mut RenetClient,
+    ) -> Result<(), WebRtcClientError> {
         if let Some(reason) = self.netcode_client.disconnect_reason() {
             client.disconnect_due_to_transport();
-            return Err(WebRtcClientError::Netcode(NetcodeError::Disconnected(reason)));
+            return Err(WebRtcClientError::Netcode(NetcodeError::Disconnected(
+                reason,
+            )));
         }
 
         if client.disconnect_reason().is_some() && !self.netcode_client.is_disconnected() {
@@ -84,7 +102,10 @@ impl WebRtcNetcodeClientTransport {
         loop {
             match self.inbox.try_next() {
                 Ok(Some(mut packet)) => {
-                    log::trace!("web transport received datachannel packet bytes={}", packet.len());
+                    log::trace!(
+                        "web transport received datachannel packet bytes={}",
+                        packet.len()
+                    );
                     if let Some(payload) = self.netcode_client.process_packet(&mut packet) {
                         client.process_packet(payload);
                     }
@@ -102,7 +123,10 @@ impl WebRtcNetcodeClientTransport {
 
         if let Some((packet, _addr)) = self.netcode_client.update(duration) {
             let packet = packet.to_vec();
-            log::trace!("web transport sending netcode packet bytes={}", packet.len());
+            log::trace!(
+                "web transport sending netcode packet bytes={}",
+                packet.len()
+            );
             self.send_data_channel_packet(&packet)?;
         }
 
@@ -111,7 +135,9 @@ impl WebRtcNetcodeClientTransport {
 
     pub fn send_packets(&mut self, client: &mut RenetClient) -> Result<(), WebRtcClientError> {
         if let Some(reason) = self.netcode_client.disconnect_reason() {
-            return Err(WebRtcClientError::Netcode(NetcodeError::Disconnected(reason)));
+            return Err(WebRtcClientError::Netcode(NetcodeError::Disconnected(
+                reason,
+            )));
         }
 
         let packets = client.get_packets_to_send();
@@ -185,7 +211,9 @@ pub async fn connect_via_sdp_http_with_overrides(
     let data_channel = peer.create_data_channel_with_data_channel_dict("renet", &data_channel_init);
     data_channel.set_binary_type(RtcDataChannelType::Arraybuffer);
 
-    let offer_js = JsFuture::from(peer.create_offer()).await.map_err(js_error)?;
+    let offer_js = JsFuture::from(peer.create_offer())
+        .await
+        .map_err(js_error)?;
     let offer_sdp = Reflect::get(&offer_js, &JsValue::from_str("sdp"))
         .map_err(js_error)?
         .as_string()
@@ -217,13 +245,20 @@ pub async fn connect_via_sdp_http_with_overrides(
         Err(err) => return Err(err),
     }
 
-    let local_description = peer.local_description().ok_or(WebRtcClientError::MissingLocalSdp)?;
+    let local_description = peer
+        .local_description()
+        .ok_or(WebRtcClientError::MissingLocalSdp)?;
     let local_sdp = local_description.sdp();
     if local_sdp.trim().is_empty() {
         return Err(WebRtcClientError::MissingLocalSdp);
     }
 
-    let answer = post_offer(&session.webrtc_offer_url, local_sdp).await?;
+    let answer = post_offer(
+        &session.webrtc_offer_url,
+        local_sdp,
+        session.session_token.as_deref(),
+    )
+    .await?;
     if answer.client_id != session.client_id {
         return Err(WebRtcClientError::ClientIdMismatch {
             session_client_id: session.client_id,
@@ -231,7 +266,11 @@ pub async fn connect_via_sdp_http_with_overrides(
         });
     }
 
-    log::debug!("received SDP answer for client_id={} ({} bytes)", answer.client_id, answer.sdp.len());
+    log::debug!(
+        "received SDP answer for client_id={} ({} bytes)",
+        answer.client_id,
+        answer.sdp.len()
+    );
 
     let remote_answer = RtcSessionDescriptionInit::new(RtcSdpType::Answer);
     remote_answer.set_sdp(&answer.sdp);
@@ -240,7 +279,10 @@ pub async fn connect_via_sdp_http_with_overrides(
         .map_err(js_error)?;
 
     await_data_channel_open(&data_channel).await?;
-    log::info!("web data channel is open for client_id={}", answer.client_id);
+    log::info!(
+        "web data channel is open for client_id={}",
+        answer.client_id
+    );
 
     let (tx, rx) = mpsc::unbounded::<Vec<u8>>();
     let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
@@ -262,12 +304,12 @@ pub async fn connect_via_sdp_http_with_overrides(
         );
     }
 
-    let server_addr = selected_webrtc_addr
-        .parse()
-        .map_err(|source| WebRtcClientError::InvalidSessionWebRtcAddr {
+    let server_addr = selected_webrtc_addr.parse().map_err(|source| {
+        WebRtcClientError::InvalidSessionWebRtcAddr {
             addr: selected_webrtc_addr.to_owned(),
             source,
-        })?;
+        }
+    })?;
 
     let authentication = ClientAuthentication::Unsecure {
         protocol_id,
@@ -293,20 +335,28 @@ pub async fn connect_via_sdp_http_with_overrides(
 async fn create_session(base_http: &str) -> Result<SessionCreateResponse, WebRtcClientError> {
     let url = format!("{}/api/session/new", base_http.trim_end_matches('/'));
     log::debug!("requesting web session: {url}");
-    let response = Request::post(&url)
-        .send()
-        .await
-        .map_err(|err| WebRtcClientError::HttpRequest {
-            url: url.clone(),
-            detail: err.to_string(),
-        })?;
+    let response =
+        Request::post(&url)
+            .send()
+            .await
+            .map_err(|err| WebRtcClientError::HttpRequest {
+                url: url.clone(),
+                detail: err.to_string(),
+            })?;
 
     decode_json_response(response, &url).await
 }
 
-async fn post_offer(url: &str, sdp: String) -> Result<SdpHttpAnswerResponse, WebRtcClientError> {
+async fn post_offer(
+    url: &str,
+    sdp: String,
+    session_token: Option<&str>,
+) -> Result<SdpHttpAnswerResponse, WebRtcClientError> {
     log::debug!("posting SDP offer to {url}");
-    let request = SdpHttpOfferRequest { sdp };
+    let request = SdpHttpOfferRequest {
+        sdp,
+        session_token: session_token.map(str::to_string),
+    };
     let response = Request::post(url)
         .json(&request)
         .map_err(|err| WebRtcClientError::HttpRequest {
@@ -329,7 +379,10 @@ async fn decode_json_response<T: serde::de::DeserializeOwned>(
 ) -> Result<T, WebRtcClientError> {
     if !response.ok() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| "<failed to read response body>".to_string());
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<failed to read response body>".to_string());
         return Err(WebRtcClientError::HttpStatus {
             url: url.to_string(),
             status,
