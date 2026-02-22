@@ -18,7 +18,7 @@ web-build web_http_base="" web_webrtc_addr="":
   trunk build
 
 # Starts one server instance. mode=ui (default) or mode=headless.
-server mode="ui" log="server=debug,renet_server=debug,shared=debug,tower_http=debug,tracing::span=warn,bevy_render=warn,wgpu=warn,wgpu_core=warn,wgpu_hal=warn,naga=warn,info":
+server mode="ui" log="server=debug,renet_cross=debug,shared=debug,tower_http=debug,tracing::span=warn,bevy_render=warn,wgpu=warn,wgpu_core=warn,wgpu_hal=warn,naga=warn,info":
   cd "{{ROOT}}" && \
   RUST_LOG="{{log}}" \
   RUST_LOG_SPAN_EVENTS=none \
@@ -26,7 +26,7 @@ server mode="ui" log="server=debug,renet_server=debug,shared=debug,tower_http=de
   cargo run -p server -- --mode "{{mode}}"
 
 # Convenience recipe to run the Bevy server with map/network debug UI.
-server-ui log="server=debug,renet_server=debug,shared=debug,tower_http=debug,tracing::span=warn,bevy_render=warn,wgpu=warn,wgpu_core=warn,wgpu_hal=warn,naga=warn,info":
+server-ui log="server=debug,renet_cross=debug,shared=debug,tower_http=debug,tracing::span=warn,bevy_render=warn,wgpu=warn,wgpu_core=warn,wgpu_hal=warn,naga=warn,info":
   just server mode="ui" log="{{log}}"
 
 # Starts one native desktop client instance using clap defaults.

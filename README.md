@@ -13,7 +13,7 @@ This crate intentionally does **not** re-export `renet`. Users should depend on 
 ```toml
 [dependencies]
 renet = "2"
-renet-server = "0.1"
+renet-cross = "0.1"
 ```
 
 ### Server setup helper
@@ -22,7 +22,7 @@ renet-server = "0.1"
 use std::{net::SocketAddr, time::Duration};
 
 use renet::{ConnectionConfig, RenetServer, ServerEvent};
-use renet_server::{
+use renet_cross::{
     BootstrapConfig, BootstrapService, MixedTransportBuilder, MonotonicClientIdAllocator,
     ServerAuthentication, UnsecureDevAuthPolicy,
 };
@@ -63,7 +63,7 @@ let bootstrap = BootstrapService::new(
 use std::time::Duration;
 
 use renet::RenetClient;
-use renet_server::{connect_via_session_http_blocking, NativeConnectOptions};
+use renet_cross::{connect_via_session_http_blocking, NativeConnectOptions};
 
 let (mut client, mut transport, _client_id): (_, _, u64) =
     connect_via_session_http_blocking(

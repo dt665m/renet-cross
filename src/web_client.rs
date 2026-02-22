@@ -1,6 +1,6 @@
 use std::{net::AddrParseError, time::Duration};
 
-use futures_channel::mpsc;
+use futures_channel::mpsc::{self, TryRecvError};
 use gloo_net::http::Request;
 use gloo_timers::future::TimeoutFuture;
 use js_sys::{Array, ArrayBuffer, Reflect, Uint8Array};
@@ -100,8 +100,8 @@ impl WebRtcNetcodeClientTransport {
         }
 
         loop {
-            match self.inbox.try_next() {
-                Ok(Some(mut packet)) => {
+            match self.inbox.try_recv() {
+                Ok(mut packet) => {
                     log::trace!(
                         "web transport received datachannel packet bytes={}",
                         packet.len()
@@ -110,8 +110,7 @@ impl WebRtcNetcodeClientTransport {
                         client.process_packet(payload);
                     }
                 }
-                Ok(None) => break,
-                Err(_) => break,
+                Err(TryRecvError::Empty | TryRecvError::Closed) => break,
             }
         }
 

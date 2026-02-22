@@ -455,8 +455,20 @@ impl WebRtcNetcodeServerTransport {
             match peer.rtc.poll_output()? {
                 Output::Timeout(_) => break,
                 Output::Transmit(transmit) => {
-                    self.socket
-                        .send_to(&transmit.contents, transmit.destination)?;
+                    if let Err(err) = self
+                        .socket
+                        .send_to(&transmit.contents, transmit.destination)
+                    {
+                        if is_non_fatal_webrtc_send_error(&err) {
+                            log::trace!(
+                                "ignoring non-fatal webrtc send error to {}: {}",
+                                transmit.destination,
+                                err
+                            );
+                            continue;
+                        }
+                        return Err(err.into());
+                    }
                 }
                 Output::Event(event) => {
                     self.handle_peer_event(peer, event, &mut pending_server_results)
@@ -618,4 +630,18 @@ fn is_receive_queue_full_error(err: &str0m::RtcError) -> bool {
     err.to_string()
         .to_ascii_lowercase()
         .contains("receive queue full")
+}
+
+fn is_non_fatal_webrtc_send_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::AddrNotAvailable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::NotConnected
+    )
 }

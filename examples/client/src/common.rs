@@ -567,7 +567,7 @@ struct PendingWebBootstrap {
 
 fn default_log_filter() -> String {
     std::env::var("RUST_LOG").unwrap_or_else(|_| {
-        "info,client=info,renet=warn,renetcode=warn,renet_server=warn,shared=info,wgpu=warn,naga=warn"
+        "info,client=info,renet=warn,renetcode=warn,renet_cross=warn,shared=info,wgpu=warn,naga=warn"
             .to_string()
     })
 }

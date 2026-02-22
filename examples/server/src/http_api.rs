@@ -5,7 +5,7 @@ use std::{
 };
 
 use axum_server::tls_rustls::RustlsConfig;
-use renet_server::{
+use renet_cross::{
     BootstrapAxumState, DefaultBootstrapService, MixedServerTransport, SdpHttpHookConfig,
     bootstrap_router,
 };

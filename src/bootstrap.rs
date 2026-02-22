@@ -1,11 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
-    sync::{
-        Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
+};
+#[cfg(not(target_arch = "wasm32"))]
+use std::{
+    sync::Mutex,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use renet::ClientId;
@@ -340,6 +342,7 @@ where
 pub type DefaultBootstrapService =
     BootstrapService<MonotonicClientIdAllocator, UnsecureDevAuthPolicy>;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn unix_now_duration() -> Result<Duration, std::time::SystemTimeError> {
     SystemTime::now().duration_since(UNIX_EPOCH)
 }

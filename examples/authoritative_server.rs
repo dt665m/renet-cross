@@ -5,7 +5,7 @@ use std::{
 };
 
 use renet::{ConnectionConfig, DefaultChannel, RenetServer, ServerEvent};
-use renet_server::{
+use renet_cross::{
     MixedServerTransport, NetcodeError, Rtc, ServerAuthentication, ServerConfig,
     UdpNetcodeServerTransport, WebRtcNetcodeServerTransport,
 };

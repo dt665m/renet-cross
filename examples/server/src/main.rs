@@ -15,7 +15,7 @@ use bevy::{
 };
 use clap::{Parser, ValueEnum};
 use renet::{ConnectionConfig, DefaultChannel, RenetServer, ServerEvent};
-use renet_server::{
+use renet_cross::{
     BootstrapConfig, BootstrapService, MixedServerTransport, MixedTransportBuilder,
     MonotonicClientIdAllocator, ServerAuthentication, UnsecureDevAuthPolicy,
 };
