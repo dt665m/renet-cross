@@ -2,6 +2,8 @@
 name = "renet-cross"
 version = "0.1.0"
 edition = "2024"
+description = "renet udp / webrtc cross support"
+license-file = "LICENSE"
 
 [workspace]
 members = ["examples/shared", "examples/server", "examples/client"]
@@ -10,7 +12,12 @@ resolver = "2"
 [features]
 default = ["native-sync", "native-async"]
 axum = ["dep:axum"]
-native-sync = ["dep:reqwest", "reqwest/blocking", "reqwest/default-tls", "reqwest/json"]
+native-sync = [
+  "dep:reqwest",
+  "reqwest/blocking",
+  "reqwest/default-tls",
+  "reqwest/json",
+]
 native-async = ["dep:reqwest", "reqwest/default-tls", "reqwest/json"]
 
 [dependencies]
