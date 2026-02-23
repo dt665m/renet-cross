@@ -230,7 +230,10 @@ fn default_public_http_base(http_bind: SocketAddr, tls_enabled: bool) -> String 
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info,sctp_proto=error"),
+    )
+    .init();
 
     let args = ServerArgs::parse();
     let ServerArgs {

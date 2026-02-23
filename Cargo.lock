@@ -5174,7 +5174,7 @@ dependencies = [
 
 [[package]]
 name = "renet-cross"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "futures-channel",
@@ -5497,8 +5497,7 @@ dependencies = [
 [[package]]
 name = "sctp-proto"
 version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39004d91c2b22aca3f16d8a9dbc383b2b9495812669d137b82c85b76b579baae"
+source = "git+https://github.com/dt665m/sctp-proto.git?branch=feat%2Fi-forward-tsn#15c828bcbefe1ff1d891c785a09d48d559dfc97d"
 dependencies = [
  "bytes",
  "crc",

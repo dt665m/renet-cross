@@ -1,6 +1,6 @@
 [package]
 name = "renet-cross"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "renet udp / webrtc cross support"
 license-file = "LICENSE"
@@ -60,3 +60,6 @@ web-sys = { version = "0.3.82", features = [
 serde_json = "1.0.145"
 tokio = { version = "1.49.0", features = ["macros", "rt"] }
 tower = { version = "0.5.2", features = ["util"] }
+
+[patch.crates-io]
+sctp-proto = { git = "https://github.com/dt665m/sctp-proto.git", branch = "feat/i-forward-tsn" }

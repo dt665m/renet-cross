@@ -235,6 +235,8 @@ impl WebRtcNetcodeServerTransport {
     }
 
     pub fn send_packets(&mut self, server: &mut RenetServer) {
+        let mut dirty_peers = Vec::new();
+
         for client_id in self.netcode_server.clients_id() {
             let packets = match server.get_packets_to_send(client_id) {
                 Ok(value) => value,
@@ -243,6 +245,10 @@ impl WebRtcNetcodeServerTransport {
                     continue;
                 }
             };
+
+            if packets.is_empty() {
+                continue;
+            }
 
             for packet in packets {
                 match self
@@ -261,6 +267,44 @@ impl WebRtcNetcodeServerTransport {
                         break;
                     }
                 }
+            }
+
+            dirty_peers.push(client_id);
+        }
+
+        // Flush RTC output immediately so SCTP data is transmitted this frame
+        // rather than sitting buffered until the next update().
+        for client_id in dirty_peers {
+            self.flush_peer_output(client_id);
+        }
+    }
+
+    fn flush_peer_output(&mut self, client_id: ClientId) {
+        let Some(peer) = self.peers.get_mut(&client_id) else {
+            return;
+        };
+        if !peer.rtc.is_alive() {
+            return;
+        }
+
+        for _ in 0..MAX_WEBRTC_DRAIN_STEPS_PER_PEER {
+            match peer.rtc.poll_output() {
+                Ok(Output::Transmit(transmit)) => {
+                    if let Err(err) = self
+                        .socket
+                        .send_to(&transmit.contents, transmit.destination)
+                    {
+                        if is_non_fatal_webrtc_send_error(&err) {
+                            continue;
+                        }
+                        log::debug!(
+                            "send error during flush for client {client_id}: {err}"
+                        );
+                        break;
+                    }
+                }
+                Ok(Output::Event(_)) => {}
+                Ok(Output::Timeout(_)) | Err(_) => break,
             }
         }
     }
@@ -328,6 +372,11 @@ impl WebRtcNetcodeServerTransport {
                                         "dropping overloaded DTLS datagram from {source} for client {client_id}: {err}"
                                     );
                                     queue_overflow = true;
+                                } else if is_malformed_webrtc_input_error(&err) {
+                                    log::debug!(
+                                        "dropping malformed DTLS/SCTP datagram from {source} for client {client_id}: {err}"
+                                    );
+                                    continue;
                                 } else {
                                     return Err(err.into());
                                 }
@@ -371,6 +420,10 @@ impl WebRtcNetcodeServerTransport {
         }
 
         self.peers.iter().find_map(|(client_id, peer)| {
+            if !source_matches_known_remote(source, peer.remote_addr()) {
+                return None;
+            }
+
             if peer.rtc.accepts(input) {
                 Some(*client_id)
             } else {
@@ -632,6 +685,20 @@ fn is_receive_queue_full_error(err: &str0m::RtcError) -> bool {
         .contains("receive queue full")
 }
 
+fn is_malformed_webrtc_input_error(err: &str0m::RtcError) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains("chunk too short")
+        || message.contains("unable to parse sctp packet")
+        || message.contains("failed to parse sctp packet")
+}
+
+fn source_matches_known_remote(source: SocketAddr, known_remote: Option<SocketAddr>) -> bool {
+    match known_remote {
+        Some(remote) => source == remote,
+        None => true,
+    }
+}
+
 fn is_non_fatal_webrtc_send_error(err: &io::Error) -> bool {
     matches!(
         err.kind(),
@@ -644,4 +711,37 @@ fn is_non_fatal_webrtc_send_error(err: &io::Error) -> bool {
             | io::ErrorKind::TimedOut
             | io::ErrorKind::NotConnected
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    use super::source_matches_known_remote;
+
+    #[test]
+    fn source_matches_when_remote_unknown() {
+        let source = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), 44321));
+        assert!(source_matches_known_remote(source, None));
+    }
+
+    #[test]
+    fn source_matches_exact_remote() {
+        let source = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 9), 55000));
+        assert!(source_matches_known_remote(source, Some(source)));
+    }
+
+    #[test]
+    fn source_rejects_same_ip_different_port() {
+        let source = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 9), 55001));
+        let known = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 9), 55000));
+        assert!(!source_matches_known_remote(source, Some(known)));
+    }
+
+    #[test]
+    fn source_rejects_different_ip() {
+        let source = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 9), 55001));
+        let known = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 10), 55001));
+        assert!(!source_matches_known_remote(source, Some(known)));
+    }
 }
