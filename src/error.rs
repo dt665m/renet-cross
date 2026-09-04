@@ -19,6 +19,12 @@ pub enum TransportError {
     DataChannelBackpressure { client_id: ClientId },
     #[error("no registered webrtc peer for client {client_id}")]
     MissingPeer { client_id: ClientId },
+    #[error("webrtc peer {client_id} panicked during {context}: {panic}")]
+    PeerPanicked {
+        client_id: ClientId,
+        context: &'static str,
+        panic: String,
+    },
 }
 
 impl From<TokenGenerationError> for TransportError {
