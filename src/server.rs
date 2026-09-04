@@ -1,9 +1,7 @@
 use std::{
-    any::Any,
     collections::HashMap,
     io,
     net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket},
-    panic::{AssertUnwindSafe, catch_unwind},
     time::{Duration, Instant},
 };
 
@@ -205,10 +203,7 @@ impl WebRtcNetcodeServerTransport {
                         pending_server_results = results;
                     }
                     Err(err) => {
-                        if matches!(
-                            err,
-                            TransportError::Rtc(_) | TransportError::PeerPanicked { .. }
-                        ) {
+                        if matches!(err, TransportError::Rtc(_)) {
                             log::warn!(
                                 "webRTC peer {client_id} runtime failure; disconnecting peer: {err}"
                             );
@@ -382,22 +377,7 @@ impl WebRtcNetcodeServerTransport {
                         if let Some(peer) = self.peers.get_mut(&client_id) {
                             peer.remote_addr.get_or_insert(source);
                             self.addr_to_client_id.insert(source, client_id);
-                            let handle_input_result =
-                                catch_unwind(AssertUnwindSafe(|| peer.rtc.handle_input(input)));
-                            let handle_input_result = match handle_input_result {
-                                Ok(result) => result,
-                                Err(payload) => {
-                                    let panic = panic_payload_to_string(payload.as_ref());
-                                    log::warn!(
-                                        "webRTC peer {client_id} panicked during handle_input from {source}: {panic}; disconnecting peer"
-                                    );
-                                    peer.rtc.disconnect();
-                                    touched_peers.push(client_id);
-                                    continue;
-                                }
-                            };
-
-                            if let Err(err) = handle_input_result {
+                            if let Err(err) = peer.rtc.handle_input(input) {
                                 if is_receive_queue_full_error(&err) {
                                     log::debug!(
                                         "dropping overloaded DTLS datagram from {source} for client {client_id}: {err}"
@@ -526,19 +506,7 @@ impl WebRtcNetcodeServerTransport {
         peer: &mut ServerPeer,
         max_steps: usize,
     ) -> Result<Vec<OwnedServerResult>, TransportError> {
-        let timeout_result = catch_unwind(AssertUnwindSafe(|| {
-            peer.rtc.handle_input(Input::Timeout(Instant::now()))
-        }));
-        match timeout_result {
-            Ok(result) => result?,
-            Err(payload) => {
-                return Err(TransportError::PeerPanicked {
-                    client_id: peer.client_id(),
-                    context: "handle_timeout_input",
-                    panic: panic_payload_to_string(payload.as_ref()),
-                });
-            }
-        }
+        peer.rtc.handle_input(Input::Timeout(Instant::now()))?;
 
         let mut pending_server_results = Vec::new();
         let mut steps = 0usize;
@@ -549,19 +517,7 @@ impl WebRtcNetcodeServerTransport {
             }
             steps = steps.saturating_add(1);
 
-            let poll_output_result = catch_unwind(AssertUnwindSafe(|| peer.rtc.poll_output()));
-            let output = match poll_output_result {
-                Ok(result) => result?,
-                Err(payload) => {
-                    return Err(TransportError::PeerPanicked {
-                        client_id: peer.client_id(),
-                        context: "poll_output",
-                        panic: panic_payload_to_string(payload.as_ref()),
-                    });
-                }
-            };
-
-            match output {
+            match peer.rtc.poll_output()? {
                 Output::Timeout(_) => break,
                 Output::Transmit(transmit) => {
                     if let Err(err) = self
@@ -767,18 +723,6 @@ fn is_non_fatal_webrtc_send_error(err: &io::Error) -> bool {
             | io::ErrorKind::TimedOut
             | io::ErrorKind::NotConnected
     )
-}
-
-fn panic_payload_to_string(payload: &(dyn Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&'static str>() {
-        return (*message).to_owned();
-    }
-
-    if let Some(message) = payload.downcast_ref::<String>() {
-        return message.clone();
-    }
-
-    "<non-string panic payload>".to_owned()
 }
 
 #[cfg(test)]
