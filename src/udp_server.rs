@@ -1,6 +1,7 @@
 use std::{
     io,
     net::{SocketAddr, UdpSocket},
+    num::NonZeroUsize,
     time::Duration,
 };
 
@@ -16,7 +17,10 @@ use crate::{
 pub struct UdpNetcodeServerTransport {
     socket: UdpSocket,
     netcode_server: NetcodeServer,
-    buffer: [u8; NETCODE_MAX_PACKET_BYTES],
+    // Enforce packet size after receiving the entire datagram; don't interpret a
+    // truncated prefix as a valid packet or fail the pump on Windows oversize IO.
+    buffer: [u8; 65_535],
+    max_datagrams_per_update: NonZeroUsize,
 }
 
 impl UdpNetcodeServerTransport {
@@ -27,12 +31,19 @@ impl UdpNetcodeServerTransport {
         Ok(Self {
             socket,
             netcode_server,
-            buffer: [0; NETCODE_MAX_PACKET_BYTES],
+            buffer: [0; 65_535],
+            max_datagrams_per_update: NonZeroUsize::new(256).unwrap(),
         })
     }
 
     pub fn addresses(&self) -> Vec<SocketAddr> {
         self.netcode_server.addresses()
+    }
+
+    /// Bound receive work per call, including malformed datagrams. Remaining
+    /// traffic stays in the OS queue while keepalives and disconnects progress.
+    pub fn set_max_datagrams_per_update(&mut self, limit: NonZeroUsize) {
+        self.max_datagrams_per_update = limit;
     }
 
     pub fn max_clients(&self) -> usize {
@@ -75,21 +86,17 @@ impl UdpNetcodeServerTransport {
     ) -> Result<(), TransportError> {
         self.netcode_server.update(duration);
 
-        loop {
-            match self.socket.recv_from(&mut self.buffer) {
-                Ok((len, source)) => {
-                    let result = self
-                        .netcode_server
-                        .process_packet(source, &mut self.buffer[..len]);
-                    let result = to_owned_server_result(result);
-                    self.handle_server_result(result, server);
-                }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => break,
-                Err(err) if err.kind() == io::ErrorKind::ConnectionReset => continue,
-                Err(err) => return Err(err.into()),
+        crate::udp_io::receive_with_budget(self.max_datagrams_per_update, || {
+            let (len, source) = self.socket.recv_from(&mut self.buffer)?;
+            if len <= NETCODE_MAX_PACKET_BYTES {
+                let result = self
+                    .netcode_server
+                    .process_packet(source, &mut self.buffer[..len]);
+                let result = to_owned_server_result(result);
+                self.handle_server_result(result, server);
             }
-        }
+            Ok(())
+        })?;
 
         for client_id in self.netcode_server.clients_id() {
             let result = self.netcode_server.update_client(client_id);

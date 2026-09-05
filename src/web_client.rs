@@ -1,10 +1,9 @@
-use std::{net::AddrParseError, time::Duration};
+use std::{cell::RefCell, net::AddrParseError, rc::Rc, time::Duration};
 
-use futures_channel::mpsc::{self, TryRecvError};
 use gloo_net::http::Request;
 use gloo_timers::future::TimeoutFuture;
 use js_sys::{Array, ArrayBuffer, Reflect, Uint8Array};
-use renet::{ConnectionConfig, RenetClient};
+use renet::RenetClient;
 use renetcode::{ClientAuthentication, NetcodeClient, NetcodeError};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
@@ -14,7 +13,8 @@ use web_sys::{
     RtcSessionDescriptionInit,
 };
 
-use crate::SessionCreateResponse;
+use crate::web_config::{PacketInbox, fits_send_budget};
+use crate::{SessionCreateResponse, WebRtcClientStats, WebRtcConnectOptions, WebRtcOptionsError};
 
 const ICE_GATHER_TIMEOUT_MS: u32 = 8_000;
 const DATA_CHANNEL_OPEN_TIMEOUT_MS: u32 = 30_000;
@@ -22,6 +22,8 @@ const STATE_POLL_INTERVAL_MS: u32 = 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WebRtcClientError {
+    #[error(transparent)]
+    Options(#[from] WebRtcOptionsError),
     #[error("HTTP request to {url} failed: {detail}")]
     HttpRequest { url: String, detail: String },
     #[error("HTTP {status} from {url}: {body}")]
@@ -72,14 +74,35 @@ struct SdpHttpAnswerResponse {
 }
 
 pub struct WebRtcNetcodeClientTransport {
-    _peer: RtcPeerConnection,
+    _peer: PeerGuard,
     data_channel: RtcDataChannel,
     netcode_client: NetcodeClient,
-    inbox: mpsc::UnboundedReceiver<Vec<u8>>,
+    inbox: Rc<RefCell<PacketInbox>>,
+    max_buffered_amount: u32,
     _on_message: Closure<dyn FnMut(MessageEvent)>,
 }
 
+struct PeerGuard(RtcPeerConnection);
+
+impl Drop for PeerGuard {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+impl Drop for WebRtcNetcodeClientTransport {
+    fn drop(&mut self) {
+        self.data_channel.set_onmessage(None);
+        self.data_channel.close();
+    }
+}
+
 impl WebRtcNetcodeClientTransport {
+    /// Local queue drop counters. Renet handles recovery of reliable messages.
+    pub fn stats(&self) -> WebRtcClientStats {
+        self.inbox.borrow().stats
+    }
+
     pub fn update(
         &mut self,
         duration: Duration,
@@ -92,32 +115,28 @@ impl WebRtcNetcodeClientTransport {
             )));
         }
 
-        if client.disconnect_reason().is_some() && !self.netcode_client.is_disconnected() {
-            if let Ok((_addr, packet)) = self.netcode_client.disconnect() {
-                let packet = packet.to_vec();
-                let _ = self.send_data_channel_packet(&packet);
-            }
+        if client.disconnect_reason().is_some()
+            && !self.netcode_client.is_disconnected()
+            && let Ok((_addr, packet)) = self.netcode_client.disconnect()
+        {
+            let packet = packet.to_vec();
+            let _ = self.send_data_channel_packet(&packet);
         }
 
-        loop {
-            match self.inbox.try_recv() {
-                Ok(mut packet) => {
-                    log::trace!(
-                        "web transport received datachannel packet bytes={}",
-                        packet.len()
-                    );
-                    if let Some(payload) = self.netcode_client.process_packet(&mut packet) {
-                        client.process_packet(payload);
-                    }
-                }
-                Err(TryRecvError::Empty | TryRecvError::Closed) => break,
-            }
+        if matches!(
+            self.data_channel.ready_state(),
+            RtcDataChannelState::Closing | RtcDataChannelState::Closed
+        ) {
+            client.disconnect_due_to_transport();
+            return Err(WebRtcClientError::DataChannelState {
+                state: data_channel_state_label(self.data_channel.ready_state()),
+            });
         }
 
-        if self.netcode_client.is_connected() {
-            client.set_connected();
-        } else if self.netcode_client.is_connecting() {
-            client.set_connecting();
+        while let Some(mut packet) = self.inbox.borrow_mut().pop() {
+            if let Some(payload) = self.netcode_client.process_packet(&mut packet) {
+                client.process_packet(payload);
+            }
         }
 
         if let Some((packet, _addr)) = self.netcode_client.update(duration) {
@@ -127,6 +146,19 @@ impl WebRtcNetcodeClientTransport {
                 packet.len()
             );
             self.send_data_channel_packet(&packet)?;
+        }
+
+        if let Some(reason) = self.netcode_client.disconnect_reason() {
+            client.disconnect_due_to_transport();
+            return Err(WebRtcClientError::Netcode(NetcodeError::Disconnected(
+                reason,
+            )));
+        }
+
+        if self.netcode_client.is_connected() {
+            client.set_connected();
+        } else if self.netcode_client.is_connecting() {
+            client.set_connecting();
         }
 
         Ok(())
@@ -156,10 +188,19 @@ impl WebRtcNetcodeClientTransport {
 
     fn send_data_channel_packet(&self, payload: &[u8]) -> Result<(), WebRtcClientError> {
         match self.data_channel.ready_state() {
-            RtcDataChannelState::Open => self
-                .data_channel
-                .send_with_u8_array(payload)
-                .map_err(js_error),
+            RtcDataChannelState::Open => {
+                if !fits_send_budget(
+                    self.data_channel.buffered_amount(),
+                    payload.len(),
+                    self.max_buffered_amount,
+                ) {
+                    self.inbox.borrow_mut().stats.send_backpressure_drops += 1;
+                    return Ok(());
+                }
+                self.data_channel
+                    .send_with_u8_array(payload)
+                    .map_err(js_error)
+            }
             RtcDataChannelState::Connecting => Ok(()),
             state => Err(WebRtcClientError::DataChannelState {
                 state: data_channel_state_label(state),
@@ -180,6 +221,21 @@ pub async fn connect_via_sdp_http_with_overrides(
     protocol_id: u64,
     webrtc_addr_override: Option<&str>,
 ) -> Result<(RenetClient, WebRtcNetcodeClientTransport, u64), WebRtcClientError> {
+    let options = WebRtcConnectOptions {
+        override_webrtc_addr: webrtc_addr_override.map(str::to_owned),
+        ..Default::default()
+    };
+    connect_via_sdp_http_with_options(base_http, protocol_id, options).await
+}
+
+/// Bootstrap an unsecure netcode session with explicit browser transport policy.
+/// ICE credentials configure TURN access, not game authentication.
+pub async fn connect_via_sdp_http_with_options(
+    base_http: &str,
+    protocol_id: u64,
+    options: WebRtcConnectOptions,
+) -> Result<(RenetClient, WebRtcNetcodeClientTransport, u64), WebRtcClientError> {
+    options.validate()?;
     log::info!("starting web session bootstrap against {base_http}");
     let session = create_session(base_http).await?;
     log::info!(
@@ -190,20 +246,29 @@ pub async fn connect_via_sdp_http_with_overrides(
         session.webrtc_offer_url
     );
 
-    let stun_urls = Array::new();
-    stun_urls.push(&JsValue::from_str("stun:stun.l.google.com:19302"));
-    stun_urls.push(&JsValue::from_str("stun:stun1.l.google.com:19302"));
-
-    let ice_server = RtcIceServer::new();
-    ice_server.set_urls(&JsValue::from(stun_urls));
-
     let ice_servers = Array::new();
-    ice_servers.push(&JsValue::from(ice_server));
+    for server in &options.ice_servers {
+        let urls = Array::new();
+        for url in &server.urls {
+            urls.push(&JsValue::from_str(url));
+        }
+        let ice_server = RtcIceServer::new();
+        ice_server.set_urls(&JsValue::from(urls));
+        if let Some(username) = &server.username {
+            ice_server.set_username(username);
+        }
+        if let Some(credential) = &server.credential {
+            ice_server.set_credential(credential);
+        }
+        ice_servers.push(&JsValue::from(ice_server));
+    }
 
     let config = RtcConfiguration::new();
     config.set_ice_servers(&JsValue::from(ice_servers));
 
-    let peer = RtcPeerConnection::new_with_configuration(&config).map_err(js_error)?;
+    let peer_guard =
+        PeerGuard(RtcPeerConnection::new_with_configuration(&config).map_err(js_error)?);
+    let peer = &peer_guard.0;
     let data_channel_init = RtcDataChannelInit::new();
     data_channel_init.set_ordered(false);
     data_channel_init.set_max_retransmits(0);
@@ -229,10 +294,10 @@ pub async fn connect_via_sdp_http_with_overrides(
         .await
         .map_err(js_error)?;
 
-    match await_ice_complete(&peer).await {
+    match await_ice_complete(peer).await {
         Ok(()) => {}
         Err(WebRtcClientError::IceGatherTimeout { timeout_ms }) => {
-            if local_sdp_has_candidates(&peer) {
+            if local_sdp_has_candidates(peer) {
                 log::warn!(
                     "ICE gathering timed out after {}ms; continuing with partial local SDP that already has candidates",
                     timeout_ms
@@ -283,16 +348,19 @@ pub async fn connect_via_sdp_http_with_overrides(
         answer.client_id
     );
 
-    let (tx, rx) = mpsc::unbounded::<Vec<u8>>();
+    let inbox = Rc::new(RefCell::new(PacketInbox::new(options.max_inbox_packets)));
+    let callback_inbox = Rc::clone(&inbox);
     let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
-        if let Some(bytes) = message_bytes(&event) {
+        let mut inbox = callback_inbox.borrow_mut();
+        if let Some(bytes) = message_bytes(&event, &mut inbox) {
             log::trace!("web data channel message bytes={}", bytes.len());
-            let _ = tx.unbounded_send(bytes);
+            inbox.push(bytes);
         }
     }) as Box<dyn FnMut(MessageEvent)>);
-    data_channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
 
-    let selected_webrtc_addr = webrtc_addr_override
+    let selected_webrtc_addr = options
+        .override_webrtc_addr
+        .as_deref()
         .filter(|addr| !addr.trim().is_empty())
         .unwrap_or(&session.webrtc_addr);
     if selected_webrtc_addr != session.webrtc_addr {
@@ -318,13 +386,15 @@ pub async fn connect_via_sdp_http_with_overrides(
     };
 
     let netcode_client = NetcodeClient::new(browser_now_duration(), authentication)?;
-    let renet = RenetClient::new(ConnectionConfig::default());
+    let renet = RenetClient::new(options.connection_config);
 
+    data_channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
     let transport = WebRtcNetcodeClientTransport {
-        _peer: peer,
+        _peer: peer_guard,
         data_channel,
         netcode_client,
-        inbox: rx,
+        inbox,
+        max_buffered_amount: options.max_buffered_amount,
         _on_message: on_message,
     };
 
@@ -475,15 +545,19 @@ async fn await_data_channel_open(channel: &RtcDataChannel) -> Result<(), WebRtcC
     }
 }
 
-fn message_bytes(event: &MessageEvent) -> Option<Vec<u8>> {
+fn message_bytes(event: &MessageEvent, inbox: &mut PacketInbox) -> Option<Vec<u8>> {
     let data = event.data();
 
     if let Ok(buffer) = data.clone().dyn_into::<ArrayBuffer>() {
-        return Some(Uint8Array::new(&buffer).to_vec());
+        return inbox
+            .accepts_size(buffer.byte_length() as usize)
+            .then(|| Uint8Array::new(&buffer).to_vec());
     }
 
     if let Ok(array) = data.dyn_into::<Uint8Array>() {
-        return Some(array.to_vec());
+        return inbox
+            .accepts_size(array.length() as usize)
+            .then(|| array.to_vec());
     }
 
     log::debug!("ignoring unsupported datachannel message type");

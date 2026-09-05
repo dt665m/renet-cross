@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket},
     time::{Duration, Instant},
@@ -21,7 +21,6 @@ use crate::{
 const WEBRTC_RECV_BUFFER_BYTES: usize = 65_535;
 const MAX_WEBRTC_DATAGRAMS_PER_UPDATE: usize = 256;
 const MAX_WEBRTC_DATAGRAMS_PER_PEER_PER_UPDATE: usize = 24;
-const WEBRTC_INGEST_MICRO_BATCH_SIZE: usize = 8;
 const MAX_WEBRTC_DRAIN_STEPS_PER_PEER: usize = 256;
 
 #[derive(Debug)]
@@ -31,6 +30,7 @@ pub struct ServerPeer {
     rtc: Rtc,
     data_channel: Option<ChannelId>,
     remote_addr: Option<SocketAddr>,
+    next_timeout: Option<Instant>,
 }
 
 impl ServerPeer {
@@ -41,6 +41,7 @@ impl ServerPeer {
             rtc,
             data_channel: None,
             remote_addr: None,
+            next_timeout: None,
         }
     }
 
@@ -79,8 +80,10 @@ pub struct WebRtcNetcodeServerTransport {
     netcode_server: NetcodeServer,
     receive_destination: SocketAddr,
     peers: HashMap<ClientId, ServerPeer>,
+    connected_client_ids: HashSet<ClientId>,
+    pending_renet_removals: HashSet<ClientId>,
     addr_to_client_id: HashMap<SocketAddr, ClientId>,
-    drain_round_robin_cursor: usize,
+    pending_server_results: Vec<OwnedServerResult>,
     send_payload_scratch: Vec<u8>,
     buffer: [u8; WEBRTC_RECV_BUFFER_BYTES],
 }
@@ -111,26 +114,47 @@ impl WebRtcNetcodeServerTransport {
             netcode_server,
             receive_destination,
             peers: HashMap::new(),
+            connected_client_ids: HashSet::new(),
+            pending_renet_removals: HashSet::new(),
             addr_to_client_id: HashMap::new(),
-            drain_round_robin_cursor: 0,
+            pending_server_results: Vec::new(),
             send_payload_scratch: Vec::with_capacity(NETCODE_MAX_PACKET_BYTES),
             buffer: [0; WEBRTC_RECV_BUFFER_BYTES],
         })
     }
 
     pub fn add_peer(&mut self, client_id: ClientId, rtc: Rtc) -> Option<ServerPeer> {
-        self.addr_to_client_id
-            .retain(|_, value| *value != client_id);
+        let previous = self.remove_peer(client_id);
         let peer = ServerPeer::new(client_id, rtc);
         self.addr_to_client_id
             .insert(peer.virtual_addr(), client_id);
-        self.peers.insert(client_id, peer)
+        self.peers.insert(client_id, peer);
+        previous
     }
 
+    /// Remove a peer and release its netcode slot immediately. The shared Renet
+    /// connection is removed on the next update or send_packets call.
     pub fn remove_peer(&mut self, client_id: ClientId) -> Option<ServerPeer> {
         self.addr_to_client_id
             .retain(|_, value| *value != client_id);
+        let _ = self.netcode_server.disconnect(client_id);
+        if self.connected_client_ids.remove(&client_id) {
+            self.pending_renet_removals.insert(client_id);
+        }
+        // Results queued by the old RTC must never be delivered to a replacement.
+        let old_addr = virtual_addr_for_client(client_id);
+        self.pending_server_results.retain(|result| match result {
+            OwnedServerResult::None => true,
+            OwnedServerResult::PacketToSend { addr, .. } => *addr != old_addr,
+            OwnedServerResult::Payload { client_id: id, .. }
+            | OwnedServerResult::ClientConnected { client_id: id, .. }
+            | OwnedServerResult::ClientDisconnected { client_id: id, .. } => *id != client_id,
+        });
         self.peers.remove(&client_id)
+    }
+
+    pub fn peer_count(&self) -> usize {
+        self.peers.len()
     }
 
     pub fn peer(&self, client_id: ClientId) -> Option<&ServerPeer> {
@@ -171,11 +195,16 @@ impl WebRtcNetcodeServerTransport {
     }
 
     pub fn disconnect_all(&mut self, server: &mut RenetServer) {
+        self.apply_pending_results(server);
         for client_id in self.netcode_server.clients_id() {
             let server_result = self.netcode_server.disconnect(client_id);
             let server_result = to_owned_server_result(server_result);
             self.handle_server_result(server_result, server);
         }
+        // Half-open ICE/DTLS sessions have no netcode client yet.
+        self.peers.clear();
+        self.addr_to_client_id.clear();
+        self.apply_pending_results(server);
     }
 
     pub fn update(
@@ -183,52 +212,43 @@ impl WebRtcNetcodeServerTransport {
         duration: Duration,
         server: &mut RenetServer,
     ) -> Result<(), TransportError> {
+        self.update_at(duration, server, Instant::now())
+    }
+
+    fn update_at(
+        &mut self,
+        duration: Duration,
+        server: &mut RenetServer,
+        now: Instant,
+    ) -> Result<(), TransportError> {
+        self.apply_pending_results(server);
         self.netcode_server.update(duration);
-        let routed_results = self.route_socket_input_to_peers()?;
+        // Peers supplied by signaling can already have output pending.
+        for client_id in self.peers.keys().copied().collect::<Vec<_>>() {
+            self.flush_peer_output(client_id);
+        }
+        self.apply_pending_results(server);
+        let routed_results = self.route_socket_input_to_peers(now)?;
         for result in routed_results {
             self.handle_server_result(result, server);
         }
 
-        // Drive every peer's RTC state.
+        // Drain pending negotiation/output before advancing time. str0m requires a
+        // complete output drain between every mutation, including timeout inputs.
         let peer_ids: Vec<ClientId> = self.peers.keys().copied().collect();
         for client_id in peer_ids {
-            let Some(mut peer) = self.peers.remove(&client_id) else {
-                continue;
-            };
-
-            let mut pending_server_results = Vec::new();
-            if peer.rtc.is_alive() {
-                match self.drive_peer_with_limit(&mut peer, MAX_WEBRTC_DRAIN_STEPS_PER_PEER) {
-                    Ok(results) => {
-                        pending_server_results = results;
-                    }
-                    Err(err) => {
-                        if matches!(err, TransportError::Rtc(_)) {
-                            log::warn!(
-                                "webRTC peer {client_id} runtime failure; disconnecting peer: {err}"
-                            );
-                            peer.rtc.disconnect();
-                        } else {
-                            return Err(err);
-                        }
-                    }
-                }
+            self.flush_peer_output(client_id);
+            if let Some(peer) = self.peers.get_mut(&client_id)
+                && peer.rtc.is_alive()
+                && peer.next_timeout.is_some_and(|deadline| deadline <= now)
+                && let Err(err) = peer.rtc.handle_input(Input::Timeout(now))
+            {
+                log::warn!("WebRTC timeout failed for {client_id}: {err}");
+                peer.rtc.disconnect();
             }
-
-            if peer.rtc.is_alive() {
-                self.peers.insert(client_id, peer);
-            } else {
-                self.addr_to_client_id
-                    .retain(|_, value| *value != client_id);
-                let result = self.netcode_server.disconnect(client_id);
-                let result = to_owned_server_result(result);
-                self.handle_server_result(result, server);
-            }
-
-            for result in pending_server_results {
-                self.handle_server_result(result, server);
-            }
+            self.flush_peer_output(client_id);
         }
+        self.apply_pending_results(server);
 
         // Keep netcode server-side keepalive/timeout state advancing.
         for client_id in self.netcode_server.clients_id() {
@@ -244,12 +264,12 @@ impl WebRtcNetcodeServerTransport {
             self.handle_server_result(server_result, server);
         }
 
+        self.apply_pending_results(server);
         Ok(())
     }
 
     pub fn send_packets(&mut self, server: &mut RenetServer) {
-        let mut dirty_peers = Vec::new();
-
+        self.apply_pending_results(server);
         for client_id in self.netcode_server.clients_id() {
             let packets = match server.get_packets_to_send(client_id) {
                 Ok(value) => value,
@@ -281,224 +301,122 @@ impl WebRtcNetcodeServerTransport {
                     }
                 }
             }
-
-            dirty_peers.push(client_id);
         }
 
-        // Flush RTC output immediately so SCTP data is transmitted this frame
-        // rather than sitting buffered until the next update().
-        for client_id in dirty_peers {
-            self.flush_peer_output(client_id);
+        self.apply_pending_results(server);
+    }
+
+    fn apply_pending_results(&mut self, server: &mut RenetServer) {
+        for client_id in self.pending_renet_removals.drain() {
+            server.remove_connection(client_id);
+        }
+        // Handling netcode results can write to the channel and yield more events.
+        while !self.pending_server_results.is_empty() {
+            for result in std::mem::take(&mut self.pending_server_results) {
+                self.handle_server_result(result, server);
+            }
         }
     }
 
     fn flush_peer_output(&mut self, client_id: ClientId) {
-        let Some(peer) = self.peers.get_mut(&client_id) else {
-            return;
-        };
-        if !peer.rtc.is_alive() {
-            return;
-        }
-
-        for _ in 0..MAX_WEBRTC_DRAIN_STEPS_PER_PEER {
-            match peer.rtc.poll_output() {
-                Ok(Output::Transmit(transmit)) => {
-                    if let Err(err) = self
-                        .socket
-                        .send_to(&transmit.contents, transmit.destination)
-                    {
-                        if is_non_fatal_webrtc_send_error(&err) {
-                            continue;
-                        }
-                        log::debug!("send error during flush for client {client_id}: {err}");
-                        break;
-                    }
-                }
-                Ok(Output::Event(_)) => {}
-                Ok(Output::Timeout(_)) | Err(_) => break,
-            }
-        }
-    }
-
-    fn route_socket_input_to_peers(&mut self) -> Result<Vec<OwnedServerResult>, TransportError> {
-        let destination = self.receive_destination;
-        let mut pending_server_results = Vec::new();
-        let mut per_peer_datagrams = HashMap::<ClientId, usize>::new();
-        let mut touched_peers = Vec::<ClientId>::new();
-        let mut datagrams_since_drain = 0usize;
-        let mut received_datagrams = 0usize;
-        loop {
-            if received_datagrams >= MAX_WEBRTC_DATAGRAMS_PER_UPDATE {
-                log::trace!(
-                    "webRTC socket ingest budget reached for this update (processed={MAX_WEBRTC_DATAGRAMS_PER_UPDATE})"
-                );
-                break;
-            }
-            match self.socket.recv_from(&mut self.buffer) {
-                Ok((len, source)) => {
-                    received_datagrams = received_datagrams.saturating_add(1);
-                    datagrams_since_drain = datagrams_since_drain.saturating_add(1);
-                    let receive =
-                        match Receive::new(Protocol::Udp, source, destination, &self.buffer[..len])
-                        {
-                            Ok(value) => value,
-                            Err(err) => {
-                                log::debug!("Ignoring non-webrtc packet from {source}: {err}");
-                                continue;
-                            }
-                        };
-
-                    let input = Input::Receive(Instant::now(), receive);
-
-                    if self.peers.is_empty() {
-                        continue;
-                    }
-
-                    let matched_client_id = self.resolve_client_for_input(source, &input);
-
-                    if let Some(client_id) = matched_client_id {
-                        let seen_for_peer = per_peer_datagrams.entry(client_id).or_insert(0);
-                        if *seen_for_peer >= MAX_WEBRTC_DATAGRAMS_PER_PEER_PER_UPDATE {
-                            log::trace!(
-                                "dropping excess webRTC datagram for client {client_id} (per-update cap {MAX_WEBRTC_DATAGRAMS_PER_PEER_PER_UPDATE})"
-                            );
-                            if datagrams_since_drain >= WEBRTC_INGEST_MICRO_BATCH_SIZE {
-                                self.drain_touched_peers_round_robin(
-                                    &mut touched_peers,
-                                    &mut pending_server_results,
-                                )?;
-                                datagrams_since_drain = 0;
-                            }
-                            continue;
-                        }
-                        *seen_for_peer += 1;
-
-                        let mut queue_overflow = false;
-                        if let Some(peer) = self.peers.get_mut(&client_id) {
-                            peer.remote_addr.get_or_insert(source);
-                            self.addr_to_client_id.insert(source, client_id);
-                            if let Err(err) = peer.rtc.handle_input(input) {
-                                if is_receive_queue_full_error(&err) {
-                                    log::debug!(
-                                        "dropping overloaded DTLS datagram from {source} for client {client_id}: {err}"
-                                    );
-                                    queue_overflow = true;
-                                } else if is_malformed_webrtc_input_error(&err) {
-                                    log::debug!(
-                                        "dropping malformed DTLS/SCTP datagram from {source} for client {client_id}: {err}"
-                                    );
-                                    continue;
-                                } else {
-                                    return Err(err.into());
-                                }
-                            }
-                            touched_peers.push(client_id);
-                        } else {
-                            self.addr_to_client_id.remove(&source);
-                        }
-
-                        if queue_overflow || datagrams_since_drain >= WEBRTC_INGEST_MICRO_BATCH_SIZE
-                        {
-                            self.drain_touched_peers_round_robin(
-                                &mut touched_peers,
-                                &mut pending_server_results,
-                            )?;
-                            datagrams_since_drain = 0;
-                        }
-                    } else {
-                        log::debug!(
-                            "No peer accepted incoming packet from {source} (destination={destination}, peers={})",
-                            self.peers.len()
-                        );
-                    }
-                }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => break,
-                Err(err) if err.kind() == io::ErrorKind::ConnectionReset => continue,
-                Err(err) => return Err(err.into()),
-            }
-        }
-
-        self.drain_touched_peers_round_robin(&mut touched_peers, &mut pending_server_results)?;
-        Ok(pending_server_results)
-    }
-
-    fn resolve_client_for_input(&self, source: SocketAddr, input: &Input) -> Option<ClientId> {
-        if let Some(client_id) = self.addr_to_client_id.get(&source).copied()
-            && self.peers.contains_key(&client_id)
-        {
-            return Some(client_id);
-        }
-
-        self.peers.iter().find_map(|(client_id, peer)| {
-            if !source_matches_known_remote(source, peer.remote_addr()) {
-                return None;
-            }
-
-            if peer.rtc.accepts(input) {
-                Some(*client_id)
-            } else {
-                None
-            }
-        })
-    }
-
-    fn drain_touched_peers_round_robin(
-        &mut self,
-        touched_peers: &mut Vec<ClientId>,
-        pending_server_results: &mut Vec<OwnedServerResult>,
-    ) -> Result<(), TransportError> {
-        if touched_peers.is_empty() {
-            return Ok(());
-        }
-
-        touched_peers.sort_unstable();
-        touched_peers.dedup();
-
-        let count = touched_peers.len();
-        let start = self.drain_round_robin_cursor % count;
-
-        for offset in 0..count {
-            let index = (start + offset) % count;
-            let client_id = touched_peers[index];
-            self.drive_peer_with_budget(
-                client_id,
-                MAX_WEBRTC_DRAIN_STEPS_PER_PEER,
-                pending_server_results,
-            )?;
-        }
-
-        self.drain_round_robin_cursor = (start + 1) % count;
-        touched_peers.clear();
-        Ok(())
-    }
-
-    fn drive_peer_with_budget(
-        &mut self,
-        client_id: ClientId,
-        max_steps: usize,
-        pending_server_results: &mut Vec<OwnedServerResult>,
-    ) -> Result<(), TransportError> {
         let Some(mut peer) = self.peers.remove(&client_id) else {
-            return Ok(());
+            return;
         };
-
-        let mut peer_results = Vec::new();
         if peer.rtc.is_alive() {
-            peer_results = self.drive_peer_with_limit(&mut peer, max_steps)?;
+            match self.drive_peer_with_limit(&mut peer, MAX_WEBRTC_DRAIN_STEPS_PER_PEER) {
+                Ok(results) => self.pending_server_results.extend(results),
+                Err(err) => {
+                    // A peer failure must not abort the shared socket pump, or leave
+                    // stale routes to a peer removed temporarily for borrowing.
+                    log::warn!("WebRTC peer {client_id} output failed: {err}");
+                    peer.rtc.disconnect();
+                }
+            }
         }
-
         if peer.rtc.is_alive() {
             self.peers.insert(client_id, peer);
         } else {
             self.addr_to_client_id
                 .retain(|_, value| *value != client_id);
             let result = self.netcode_server.disconnect(client_id);
-            pending_server_results.push(to_owned_server_result(result));
+            self.pending_server_results
+                .push(to_owned_server_result(result));
         }
+    }
 
-        pending_server_results.extend(peer_results);
-        Ok(())
+    fn route_socket_input_to_peers(
+        &mut self,
+        now: Instant,
+    ) -> Result<Vec<OwnedServerResult>, TransportError> {
+        let destination = self.receive_destination;
+        let mut per_peer_datagrams = HashMap::<ClientId, usize>::new();
+        for _ in 0..MAX_WEBRTC_DATAGRAMS_PER_UPDATE {
+            let (len, source) = match self.socket.recv_from(&mut self.buffer) {
+                Ok(packet) => packet,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            };
+            let Ok(receive) = Receive::new(Protocol::Udp, source, destination, &self.buffer[..len])
+            else {
+                continue;
+            };
+            let input = Input::Receive(now, receive);
+            let Some(client_id) = self.resolve_client_for_input(source, &input) else {
+                continue;
+            };
+            let seen = per_peer_datagrams.entry(client_id).or_default();
+            if *seen >= MAX_WEBRTC_DATAGRAMS_PER_PEER_PER_UPDATE {
+                continue;
+            }
+            *seen += 1;
+            if let Some(peer) = self.peers.get_mut(&client_id) {
+                // A bounded drain can yield before reaching Timeout. Drop this
+                // datagram rather than violating str0m's mutation contract.
+                if peer.next_timeout.is_none() {
+                    self.flush_peer_output(client_id);
+                    continue;
+                }
+                if let Some(old_source) = peer.remote_addr.replace(source)
+                    && old_source != source
+                    && self.addr_to_client_id.get(&old_source) == Some(&client_id)
+                {
+                    self.addr_to_client_id.remove(&old_source);
+                }
+                self.addr_to_client_id.insert(source, client_id);
+                if let Err(err) = peer.rtc.handle_input(input)
+                    && !is_receive_queue_full_error(&err)
+                    && !is_malformed_webrtc_input_error(&err)
+                {
+                    log::warn!("WebRTC input failed for {client_id}: {err}");
+                    peer.rtc.disconnect();
+                }
+            }
+            // Never ingest a second datagram while str0m still has queued output.
+            self.flush_peer_output(client_id);
+        }
+        Ok(std::mem::take(&mut self.pending_server_results))
+    }
+
+    fn resolve_client_for_input(&self, source: SocketAddr, input: &Input) -> Option<ClientId> {
+        if let Some(client_id) = self.addr_to_client_id.get(&source).copied()
+            && let Some(peer) = self.peers.get(&client_id)
+            && peer.rtc.accepts(input)
+        {
+            return Some(client_id);
+        }
+        // ICE credentials can authenticate checks from a new candidate address.
+        // Pinning the first observed source blocks candidate switching/rebinding.
+        self.peers
+            .iter()
+            .find_map(|(id, peer)| peer.rtc.accepts(input).then_some(*id))
     }
 
     fn drive_peer_with_limit(
@@ -506,19 +424,23 @@ impl WebRtcNetcodeServerTransport {
         peer: &mut ServerPeer,
         max_steps: usize,
     ) -> Result<Vec<OwnedServerResult>, TransportError> {
-        peer.rtc.handle_input(Input::Timeout(Instant::now()))?;
-
+        peer.next_timeout = None;
         let mut pending_server_results = Vec::new();
         let mut steps = 0usize;
 
         loop {
             if steps >= max_steps {
+                // Resume draining on the next opportunity. next_timeout remains
+                // None so no input/write/timeout mutation can run in between.
                 break;
             }
             steps = steps.saturating_add(1);
 
             match peer.rtc.poll_output()? {
-                Output::Timeout(_) => break,
+                Output::Timeout(deadline) => {
+                    peer.next_timeout = Some(deadline);
+                    break;
+                }
                 Output::Transmit(transmit) => {
                     if let Err(err) = self
                         .socket
@@ -561,8 +483,8 @@ impl WebRtcNetcodeServerTransport {
                 );
             }
             Event::ChannelData(data) => {
-                if peer.data_channel.is_none() {
-                    peer.data_channel = Some(data.id);
+                if peer.data_channel != Some(data.id) || !data.binary {
+                    return;
                 }
 
                 let source_addr = peer.virtual_addr();
@@ -576,6 +498,16 @@ impl WebRtcNetcodeServerTransport {
                 let mut packet = data.data;
                 let result = self.netcode_server.process_packet(source_addr, &mut packet);
                 let result = to_owned_server_result(result);
+                if let OwnedServerResult::ClientConnected { client_id, .. } = &result
+                    && *client_id != peer.client_id
+                {
+                    // The netcode identity must belong to the signaling peer. Never
+                    // let a packet overwrite another peer's virtual address route.
+                    let claimed_id = *client_id;
+                    let _ = self.netcode_server.disconnect(claimed_id);
+                    peer.rtc.disconnect();
+                    return;
+                }
                 pending_server_results.push(result);
             }
             Event::IceConnectionStateChange(state) => {
@@ -588,14 +520,12 @@ impl WebRtcNetcodeServerTransport {
                     peer.rtc.disconnect();
                 }
             }
-            Event::ChannelClose(channel_id) => {
-                if peer.data_channel == Some(channel_id) {
-                    log::info!(
-                        "webrtc channel closed for client {}: id={channel_id:?}; disconnecting peer",
-                        peer.client_id
-                    );
-                    peer.rtc.disconnect();
-                }
+            Event::ChannelClose(channel_id) if peer.data_channel == Some(channel_id) => {
+                log::info!(
+                    "webrtc channel closed for client {}: id={channel_id:?}; disconnecting peer",
+                    peer.client_id
+                );
+                peer.rtc.disconnect();
             }
             _ => {}
         }
@@ -636,10 +566,12 @@ impl WebRtcNetcodeServerTransport {
                     {
                         self.send_to_peer_lossy(client_id, &disconnect_payload);
                     }
+                    self.remove_peer(client_id);
                     return;
                 }
 
                 server.add_connection(client_id);
+                self.connected_client_ids.insert(client_id);
                 self.addr_to_client_id.insert(addr, client_id);
                 log::info!("netcode connected client_id={client_id} via webrtc route={addr}");
                 self.send_to_peer_lossy(client_id, &payload);
@@ -649,7 +581,9 @@ impl WebRtcNetcodeServerTransport {
                 addr,
                 payload,
             } => {
-                server.remove_connection(client_id);
+                if self.connected_client_ids.remove(&client_id) {
+                    server.remove_connection(client_id);
+                }
                 self.addr_to_client_id.remove(&addr);
 
                 if let Some(payload) = payload {
@@ -670,10 +604,14 @@ impl WebRtcNetcodeServerTransport {
     }
 
     fn send_to_peer(&mut self, client_id: ClientId, payload: &[u8]) -> Result<(), TransportError> {
+        self.flush_peer_output(client_id);
         let peer = self
             .peers
             .get_mut(&client_id)
             .ok_or(TransportError::MissingPeer { client_id })?;
+        if peer.next_timeout.is_none() {
+            return Err(TransportError::DataChannelBackpressure { client_id });
+        }
         let channel_id = peer
             .data_channel
             .ok_or(TransportError::DataChannelNotOpen { client_id })?;
@@ -682,8 +620,9 @@ impl WebRtcNetcodeServerTransport {
             .channel(channel_id)
             .ok_or(TransportError::DataChannelNotOpen { client_id })?;
 
-        let accepted = channel.write(true, payload)?;
-        if !accepted {
+        let accepted = channel.write(true, payload);
+        self.flush_peer_output(client_id);
+        if !accepted? {
             return Err(TransportError::DataChannelBackpressure { client_id });
         }
 
@@ -704,17 +643,12 @@ fn is_malformed_webrtc_input_error(err: &str0m::RtcError) -> bool {
         || message.contains("failed to parse sctp packet")
 }
 
-fn source_matches_known_remote(source: SocketAddr, known_remote: Option<SocketAddr>) -> bool {
-    match known_remote {
-        Some(remote) => source == remote,
-        None => true,
-    }
-}
-
 fn is_non_fatal_webrtc_send_error(err: &io::Error) -> bool {
     matches!(
         err.kind(),
-        io::ErrorKind::AddrNotAvailable
+        io::ErrorKind::WouldBlock
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::AddrNotAvailable
             | io::ErrorKind::NetworkUnreachable
             | io::ErrorKind::HostUnreachable
             | io::ErrorKind::ConnectionReset
@@ -726,34 +660,5 @@ fn is_non_fatal_webrtc_send_error(err: &io::Error) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::net::{Ipv4Addr, SocketAddr};
-
-    use super::source_matches_known_remote;
-
-    #[test]
-    fn source_matches_when_remote_unknown() {
-        let source = SocketAddr::from((Ipv4Addr::new(203, 0, 113, 7), 44321));
-        assert!(source_matches_known_remote(source, None));
-    }
-
-    #[test]
-    fn source_matches_exact_remote() {
-        let source = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 9), 55000));
-        assert!(source_matches_known_remote(source, Some(source)));
-    }
-
-    #[test]
-    fn source_rejects_same_ip_different_port() {
-        let source = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 9), 55001));
-        let known = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 9), 55000));
-        assert!(!source_matches_known_remote(source, Some(known)));
-    }
-
-    #[test]
-    fn source_rejects_different_ip() {
-        let source = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 9), 55001));
-        let known = SocketAddr::from((Ipv4Addr::new(198, 51, 100, 10), 55001));
-        assert!(!source_matches_known_remote(source, Some(known)));
-    }
-}
+#[path = "server_tests.rs"]
+mod tests;

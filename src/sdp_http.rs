@@ -36,6 +36,8 @@ pub struct SdpHttpAnswerResponse {
 pub enum SdpHttpHookError {
     #[error("client {client_id} already exists in webrtc transport")]
     DuplicateClientId { client_id: ClientId },
+    #[error("webrtc peer capacity reached ({max_clients})")]
+    CapacityReached { max_clients: usize },
     #[error("invalid SDP offer: {message}")]
     InvalidOffer { message: String },
     #[error(transparent)]
@@ -52,6 +54,13 @@ pub fn accept_offer_and_add_peer(
 ) -> Result<SdpHttpAnswerResponse, SdpHttpHookError> {
     if transport.peer(client_id).is_some() {
         return Err(SdpHttpHookError::DuplicateClientId { client_id });
+    }
+    // Count pending ICE/DTLS negotiations too: netcode's connected-client limit
+    // alone does not bound the memory spent on unauthenticated RTC instances.
+    if transport.peer_count() >= transport.max_clients() {
+        return Err(SdpHttpHookError::CapacityReached {
+            max_clients: transport.max_clients(),
+        });
     }
 
     let offer =
@@ -95,6 +104,7 @@ impl axum::response::IntoResponse for SdpHttpHookError {
 
         let status = match self {
             SdpHttpHookError::DuplicateClientId { .. } => StatusCode::CONFLICT,
+            SdpHttpHookError::CapacityReached { .. } => StatusCode::SERVICE_UNAVAILABLE,
             SdpHttpHookError::InvalidOffer { .. } => StatusCode::BAD_REQUEST,
             SdpHttpHookError::Ice(_) | SdpHttpHookError::Rtc(_) => StatusCode::UNPROCESSABLE_ENTITY,
         };
@@ -177,5 +187,49 @@ mod tests {
             result,
             Err(SdpHttpHookError::DuplicateClientId { client_id: 42 })
         ));
+    }
+
+    #[test]
+    fn pending_peers_use_capacity_before_parsing_an_offer() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let mut transport = WebRtcNetcodeServerTransport::new(
+            ServerConfig {
+                current_time: Duration::ZERO,
+                max_clients: 1,
+                protocol_id: 7,
+                public_addresses: vec![addr],
+                authentication: ServerAuthentication::Unsecure,
+            },
+            socket,
+        )
+        .unwrap();
+        transport.add_peer(1, str0m::Rtc::new(std::time::Instant::now()));
+        assert_eq!(transport.connected_clients(), 0);
+        let result = accept_offer_and_add_peer(
+            &mut transport,
+            2,
+            SdpHttpOfferRequest {
+                sdp: "not even parsed at capacity".into(),
+                session_token: None,
+            },
+            SdpHttpHookConfig::new(addr),
+        );
+        assert!(matches!(
+            result,
+            Err(SdpHttpHookError::CapacityReached { max_clients: 1 })
+        ));
+        assert!(transport.peer(2).is_none());
+        transport.remove_peer(1);
+        let result = accept_offer_and_add_peer(
+            &mut transport,
+            2,
+            SdpHttpOfferRequest {
+                sdp: "now parsed".into(),
+                session_token: None,
+            },
+            SdpHttpHookConfig::new(addr),
+        );
+        assert!(matches!(result, Err(SdpHttpHookError::InvalidOffer { .. })));
     }
 }

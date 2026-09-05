@@ -110,17 +110,29 @@ impl InMemorySessionRegistry {
     }
 
     pub fn issue(&mut self, client_id: ClientId) {
-        self.cleanup();
-        self.pending.insert(client_id, Instant::now());
+        self.issue_at(client_id, Instant::now());
+    }
+
+    fn issue_at(&mut self, client_id: ClientId, now: Instant) {
+        self.cleanup_at(now);
+        self.pending.insert(client_id, now);
     }
 
     pub fn is_pending(&mut self, client_id: ClientId) -> bool {
-        self.cleanup();
+        self.is_pending_at(client_id, Instant::now())
+    }
+
+    fn is_pending_at(&mut self, client_id: ClientId, now: Instant) -> bool {
+        self.cleanup_at(now);
         self.pending.contains_key(&client_id)
     }
 
     pub fn activate(&mut self, client_id: ClientId) -> bool {
-        self.cleanup();
+        self.activate_at(client_id, Instant::now())
+    }
+
+    fn activate_at(&mut self, client_id: ClientId, now: Instant) -> bool {
+        self.cleanup_at(now);
         if self.pending.remove(&client_id).is_some() {
             self.active.insert(client_id);
             true
@@ -134,9 +146,16 @@ impl InMemorySessionRegistry {
         self.active.remove(&client_id);
     }
 
+    /// Remove pending sessions whose age is at least the configured TTL.
+    /// Active sessions are retained until explicitly deactivated.
     pub fn cleanup(&mut self) {
+        self.cleanup_at(Instant::now());
+    }
+
+    fn cleanup_at(&mut self, now: Instant) {
         let ttl = self.ttl;
-        self.pending.retain(|_, started| started.elapsed() <= ttl);
+        self.pending
+            .retain(|_, started| now.saturating_duration_since(*started) < ttl);
     }
 }
 
@@ -349,7 +368,7 @@ pub(crate) fn unix_now_duration() -> Result<Duration, std::time::SystemTimeError
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
         InMemorySessionRegistry, MonotonicClientIdAllocator, SessionAuthPolicy,
@@ -390,12 +409,64 @@ mod tests {
     }
 
     #[test]
-    fn session_registry_expires_pending_entries() {
+    fn session_registry_expires_at_exact_deadline() {
+        let start = Instant::now();
+        let ttl = Duration::from_secs(5);
+        let deadline = start + ttl;
+        let mut registry = InMemorySessionRegistry::new(ttl);
+        registry.issue_at(1, start);
+        registry.issue_at(2, start);
+        assert!(registry.is_pending_at(1, deadline - Duration::from_nanos(1)));
+        // Activation itself performs expiry cleanup; no preceding cleanup call.
+        assert!(!registry.activate_at(2, deadline));
+        assert!(!registry.is_pending_at(1, deadline));
+        assert!(registry.pending.is_empty());
+        assert!(registry.active.is_empty());
+    }
+
+    #[test]
+    fn session_registry_zero_ttl_expires_without_clock_advance() {
+        let now = Instant::now();
         let mut registry = InMemorySessionRegistry::new(Duration::ZERO);
-        registry.issue(1);
-        std::thread::sleep(Duration::from_millis(1));
-        registry.cleanup();
-        assert!(!registry.is_pending(1));
+        registry.issue_at(1, now);
+        assert!(!registry.is_pending_at(1, now));
+        assert!(!registry.activate_at(1, now));
+    }
+
+    #[test]
+    fn session_registry_cleanup_retains_active_and_newer_pending_sessions() {
+        let start = Instant::now();
+        let ttl = Duration::from_secs(5);
+        let mut registry = InMemorySessionRegistry::new(ttl);
+        registry.issue_at(1, start);
+        registry.issue_at(2, start);
+        assert!(registry.activate_at(1, start + Duration::from_secs(1)));
+        registry.issue_at(3, start + Duration::from_secs(4));
+        registry.cleanup_at(start + ttl);
+        assert!(registry.active.contains(&1));
+        assert!(!registry.pending.contains_key(&1));
+        assert!(!registry.pending.contains_key(&2));
+        assert!(registry.pending.contains_key(&3));
+        assert!(!registry.activate_at(1, start + ttl));
+        registry.cleanup_at(start + Duration::from_secs(100));
+        assert!(registry.active.contains(&1));
+        assert!(registry.pending.is_empty());
+    }
+
+    #[test]
+    fn session_registry_deactivate_and_reissue_gets_a_fresh_ttl() {
+        let start = Instant::now();
+        let mut registry = InMemorySessionRegistry::new(Duration::from_secs(5));
+        registry.issue_at(1, start);
+        assert!(registry.activate_at(1, start));
+        registry.deactivate(1);
+        assert!(registry.active.is_empty());
+        registry.issue_at(1, start + Duration::from_secs(10));
+        assert!(registry.is_pending_at(1, start + Duration::from_secs(14)));
+        registry.deactivate(1);
+        assert!(!registry.activate_at(1, start + Duration::from_secs(14)));
+        registry.issue_at(1, start + Duration::from_secs(20));
+        assert!(!registry.activate_at(1, start + Duration::from_secs(25)));
     }
 
     #[test]

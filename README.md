@@ -1,4 +1,17 @@
-# Hybrid Bootstrap (Axum + Authoritative Mixed Transport)
+# renet-cross
+
+Transport adapters for Renet 2: native UDP clients and browser WebRTC
+DataChannels share one server. The crate handles transport and bootstrap;
+prediction, rollback, replication, and hit validation belong in the game.
+
+The WebRTC server uses str0m's synchronous, caller-driven API. Browser channels
+are unordered with `maxRetransmits = 0`, leaving message reliability to Renet.
+No QUIC, HTTP/3, or game engine integration is required.
+
+See [testing and reproduction](docs/testing.md) and the
+[str0m integration assessment](docs/str0m-assessment.md).
+
+## Hybrid Bootstrap (Axum + Authoritative Mixed Transport)
 
 This bootstrap demonstrates one authoritative game server that accepts:
 - native UDP clients
@@ -13,7 +26,7 @@ This crate intentionally does **not** re-export `renet`. Users should depend on 
 ```toml
 [dependencies]
 renet = "2"
-renet-cross = "0.1"
+renet-cross = "0.4"
 ```
 
 ### Server setup helper
@@ -103,7 +116,7 @@ flowchart LR
     A["Axum API"]
     M["MixedServerTransport"]
     R["RenetServer"]
-    S["Authoritative sim (20 Hz)"]
+    S["Authoritative sim (30 Hz)"]
   end
 
   W -->|"POST /api/session/new"| A
@@ -132,7 +145,7 @@ flowchart LR
 
 ## Tick Order (Authoritative)
 
-Per tick (`20 Hz`):
+Per tick (`30 Hz` in the example; the transport does not impose a simulation rate):
 1. `server.update(dt)`
 2. `transport.update(dt, &mut server)`
 3. process connect/disconnect and input messages
@@ -197,6 +210,13 @@ Unknown/expired session ids return `404` in the server example.
 
 ## Future Hardening (Production Path)
 
+The supplied HTTP connection helpers use `ClientAuthentication::Unsecure`.
+`SessionAuthPolicy` authenticates signaling; its session token is not a secure
+netcode connect token. Native low-level construction accepts
+`ClientAuthentication::Secure`. A complete authenticated browser bootstrap is
+still application/integration work. TURN credentials also do not authenticate a
+game account.
+
 Move from in-memory monotonic IDs to signed, time-bounded issuance:
 1. mint signed session/bootstrap tokens from trusted auth service
 2. bind token to `client_id`, audience, expiry, and optional device/account context
@@ -204,3 +224,50 @@ Move from in-memory monotonic IDs to signed, time-bounded issuance:
 4. replace unsecure connect auth with secure token issuance and key rotation
 
 This keeps transport-agnostic identity while making bootstrap secure and replay-resistant.
+
+## Browser configuration and local limits
+
+Existing `connect_via_sdp_http` and `connect_via_sdp_http_with_overrides` helpers
+keep their signatures. Use `connect_via_sdp_http_with_options` on wasm for explicit
+ICE servers, TURN credentials, Renet channel configuration, and queue limits:
+
+```rust
+use renet_cross::{WebRtcConnectOptions, WebRtcIceServer};
+
+let options = WebRtcConnectOptions {
+    ice_servers: vec![WebRtcIceServer {
+        urls: vec!["turn:relay.example.com:3478?transport=udp".into()],
+        username: Some("issued-user".into()),
+        credential: Some("short-lived-credential".into()),
+    }],
+    max_buffered_amount: 64 * 1024,
+    max_inbox_packets: 256,
+    ..Default::default()
+};
+// On wasm:
+// let (client, transport, id) =
+//     renet_cross::connect_via_sdp_http_with_options(base_http, protocol_id, options).await?;
+```
+
+Defaults keep the original Google STUN servers. An empty ICE server list uses
+host candidates only. Configuring TURN enables the browser to gather relay
+candidates; an accessible relay and appropriate credentials are still required.
+This is not a guarantee of operation on networks that block the server's UDP path.
+
+The browser drops outgoing packets that would exceed the configured buffer
+budget, rejects oversized incoming netcode packets, and drops the oldest queued
+packet when the inbox fills. Renet retries reliable messages; unreliable messages
+may be lost. `transport.stats()` distinguishes these local drops from Renet's
+network metrics. Dropping the transport closes the peer connection.
+
+Native client/server receive loops default to 256 datagram attempts per update.
+`set_max_datagrams_per_update(NonZeroUsize)` tunes that budget. Remaining datagrams
+stay in the OS queue while protocol timers continue to advance. The WebRTC pump
+also has bounded ingest/drain work and drops excess ingress instead of building
+an unbounded queue. Pump networking frequently; a low-frequency game tick need
+not be the network pump frequency.
+
+The SDP helper counts pending negotiations toward the WebRTC backend's client
+capacity and returns HTTP 503 when full. Builder `max_clients` is per backend,
+not a combined mixed-server player limit. Low-level `add_peer` is an advanced
+API; callers are responsible for admission control when bypassing SDP helpers.

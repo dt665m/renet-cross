@@ -19,9 +19,12 @@ mod server;
 #[cfg(not(target_arch = "wasm32"))]
 mod transport_builder;
 #[cfg(not(target_arch = "wasm32"))]
+mod udp_io;
+#[cfg(not(target_arch = "wasm32"))]
 mod udp_server;
 #[cfg(target_arch = "wasm32")]
 mod web_client;
+mod web_config;
 
 #[cfg(all(feature = "axum", not(target_arch = "wasm32")))]
 pub use axum_bootstrap::{BootstrapAxumState, bootstrap_router};
@@ -60,7 +63,10 @@ pub use udp_server::UdpNetcodeServerTransport;
 #[cfg(target_arch = "wasm32")]
 pub use web_client::{
     WebRtcClientError, WebRtcNetcodeClientTransport, connect_via_sdp_http,
-    connect_via_sdp_http_with_overrides,
+    connect_via_sdp_http_with_options, connect_via_sdp_http_with_overrides,
+};
+pub use web_config::{
+    WebRtcClientStats, WebRtcConnectOptions, WebRtcIceServer, WebRtcOptionsError,
 };
 
 #[cfg(feature = "axum")]

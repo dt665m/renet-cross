@@ -23,10 +23,15 @@ pub use crate::connect_via_session_http_blocking;
 pub use crate::connect_via_session_http_async;
 
 #[cfg(target_arch = "wasm32")]
-pub use crate::{WebRtcClientError, WebRtcNetcodeClientTransport, connect_via_sdp_http};
+pub use crate::{
+    WebRtcClientError, WebRtcNetcodeClientTransport, connect_via_sdp_http,
+    connect_via_sdp_http_with_options, connect_via_sdp_http_with_overrides,
+};
 
 pub use crate::{
     ClientAuthentication, ConnectToken, NETCODE_KEY_BYTES, NETCODE_USER_DATA_BYTES,
     NetcodeDisconnectReason, NetcodeError, ServerAuthentication, ServerConfig,
     TokenGenerationError, generate_random_bytes,
 };
+
+pub use crate::{WebRtcClientStats, WebRtcConnectOptions, WebRtcIceServer, WebRtcOptionsError};

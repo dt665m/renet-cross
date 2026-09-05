@@ -1,0 +1,56 @@
+name: transport-tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting and native lint
+        if: runner.os == 'Linux'
+        run: |
+          cargo fmt -p renet-cross --check
+          cargo clippy -p renet-cross --lib --tests --all-features --locked -- -D warnings
+      - name: Native transport regressions (no browser or public network)
+        run: cargo test -p renet-cross --all-features --locked
+      - name: Transport without HTTP clients
+        run: cargo test -p renet-cross --no-default-features --locked
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Browser library and lint
+        run: cargo clippy -p renet-cross --target wasm32-unknown-unknown --no-default-features --locked -- -D warnings
+      - name: Browser library with default features
+        run: cargo check -p renet-cross --target wasm32-unknown-unknown --locked
+
+  feature-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: [native-sync, native-async, axum]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p renet-cross --no-default-features --features ${{ matrix.features }} --locked

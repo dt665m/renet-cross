@@ -1,12 +1,16 @@
 use std::{
     io,
     net::{AddrParseError, SocketAddr, UdpSocket},
+    num::NonZeroUsize,
     time::Duration,
 };
 
-use renet::{ConnectionConfig, RenetClient};
+#[cfg(any(feature = "native-sync", feature = "native-async"))]
+use renet::ConnectionConfig;
+use renet::RenetClient;
 use renetcode::{ClientAuthentication, NETCODE_MAX_PACKET_BYTES, NetcodeClient, NetcodeError};
 
+#[cfg(any(feature = "native-sync", feature = "native-async"))]
 use crate::{SessionCreateResponse, bootstrap::unix_now_duration};
 
 #[derive(Debug, thiserror::Error)]
@@ -53,7 +57,10 @@ impl Default for NativeConnectOptions {
 pub struct UdpNetcodeClientTransport {
     socket: UdpSocket,
     netcode_client: NetcodeClient,
-    buffer: [u8; NETCODE_MAX_PACKET_BYTES],
+    // Receive complete datagrams before enforcing the protocol size. A smaller
+    // buffer silently truncates on Unix and can produce WSAEMSGSIZE on Windows.
+    buffer: [u8; 65_535],
+    max_datagrams_per_update: NonZeroUsize,
 }
 
 impl UdpNetcodeClientTransport {
@@ -68,8 +75,14 @@ impl UdpNetcodeClientTransport {
         Ok(Self {
             socket,
             netcode_client,
-            buffer: [0; NETCODE_MAX_PACKET_BYTES],
+            buffer: [0; 65_535],
+            max_datagrams_per_update: NonZeroUsize::new(256).unwrap(),
         })
+    }
+
+    /// Bound receive work per call, including packets from unrelated sources.
+    pub fn set_max_datagrams_per_update(&mut self, limit: NonZeroUsize) {
+        self.max_datagrams_per_update = limit;
     }
 
     pub fn update(
@@ -97,23 +110,30 @@ impl UdpNetcodeClientTransport {
             client.set_connecting();
         }
 
-        loop {
-            match self.socket.recv_from(&mut self.buffer) {
-                Ok((len, _source)) => {
-                    let packet = &mut self.buffer[..len];
-                    if let Some(payload) = self.netcode_client.process_packet(packet) {
-                        client.process_packet(payload);
-                    }
-                }
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => break,
-                Err(err) if err.kind() == io::ErrorKind::ConnectionReset => continue,
-                Err(err) => return Err(err.into()),
+        crate::udp_io::receive_with_budget(self.max_datagrams_per_update, || {
+            let (len, source) = self.socket.recv_from(&mut self.buffer)?;
+            if source == self.netcode_client.server_addr()
+                && len <= NETCODE_MAX_PACKET_BYTES
+                && let Some(payload) = self.netcode_client.process_packet(&mut self.buffer[..len])
+            {
+                client.process_packet(payload);
             }
-        }
+            Ok(())
+        })?;
 
         if let Some((packet, addr)) = self.netcode_client.update(duration) {
-            self.socket.send_to(packet, addr)?;
+            send_datagram(&self.socket, packet, addr)?;
+        }
+
+        // Reflect handshakes and timeouts in this call rather than one frame later.
+        if let Some(reason) = self.netcode_client.disconnect_reason() {
+            client.disconnect_due_to_transport();
+            return Err(NativeClientError::Netcode(NetcodeError::Disconnected(
+                reason,
+            )));
+        }
+        if self.netcode_client.is_connected() {
+            client.set_connected();
         }
 
         Ok(())
@@ -129,10 +149,27 @@ impl UdpNetcodeClientTransport {
         let packets = client.get_packets_to_send();
         for packet in packets {
             let (addr, payload) = self.netcode_client.generate_payload_packet(&packet)?;
-            self.socket.send_to(payload, addr)?;
+            send_datagram(&self.socket, payload, addr)?;
         }
 
         Ok(())
+    }
+}
+
+fn send_datagram(socket: &UdpSocket, payload: &[u8], addr: SocketAddr) -> io::Result<()> {
+    match socket.send_to(payload, addr) {
+        Ok(_) => Ok(()),
+        // This is a lossy transport: Renet retransmits reliable messages. Do not
+        // grow a second queue of stale packets behind a saturated socket.
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) =>
+        {
+            Ok(())
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -175,6 +212,7 @@ pub async fn connect_via_session_http_async(
     connect_from_session(session, protocol_id, options)
 }
 
+#[cfg(any(feature = "native-sync", feature = "native-async"))]
 fn connect_from_session(
     session: SessionCreateResponse,
     protocol_id: u64,
