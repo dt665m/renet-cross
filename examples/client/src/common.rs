@@ -590,7 +590,7 @@ pub fn run() {
         FpsOverlayPlugin {
             config: FpsOverlayConfig {
                 text_config: TextFont {
-                    font_size: 16.0,
+                    font_size: FontSize::Px(16.0),
                     ..Default::default()
                 },
                 text_color: Color::srgb(0.86, 1.0, 0.9),

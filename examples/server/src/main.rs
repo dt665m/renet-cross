@@ -1107,7 +1107,7 @@ fn spawn_network_panel(commands: &mut Commands) {
         children![(
             Text::new("server bootstrapping..."),
             TextFont {
-                font_size: 14.0,
+                font_size: FontSize::Px(14.0),
                 ..Default::default()
             },
             TextColor(Color::srgb(0.9, 0.95, 1.0)),

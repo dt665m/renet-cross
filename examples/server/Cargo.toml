@@ -5,8 +5,8 @@ edition = "2024"
 
 [dependencies]
 axum = "0.8.8"
-axum-server = { version = "0.7.2", features = ["tls-rustls"] }
-bevy = { version = "0.18.0", default-features = true }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+bevy = { version = "0.19.1", default-features = true }
 clap = { version = "4.5.53", features = ["derive", "env"] }
 env_logger = "0.11.8"
 shared = { path = "../shared" }
@@ -14,4 +14,4 @@ log = "0.4.22"
 renet = "2.0.0"
 renet_cross = { package = "renet-cross", path = "../..", features = ["axum"] }
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "time", "net"] }
-tower-http = { version = "0.6.6", features = ["fs", "trace"] }
+tower-http = { version = "0.7.1", features = ["fs", "trace"] }

@@ -403,12 +403,14 @@ impl Simulation {
     }
 }
 
+// `legacy()` keeps the bincode 1.x wire format, so the encoding is unchanged
+// across the 1.x -> 2.x upgrade.
 pub fn encode<T: Serialize>(value: &T) -> Vec<u8> {
-    bincode::serialize(value).expect("serialize")
+    bincode::serde::encode_to_vec(value, bincode::config::legacy()).expect("serialize")
 }
 
-pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, bincode::Error> {
-    bincode::deserialize(bytes)
+pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, bincode::error::DecodeError> {
+    bincode::serde::decode_from_slice(bytes, bincode::config::legacy()).map(|(value, _)| value)
 }
 
 pub fn is_newer_input_seq(candidate: u32, latest: u32) -> bool {
