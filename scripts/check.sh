@@ -10,4 +10,6 @@ done
 cargo clippy -p renet-cross --lib --tests --all-features --locked -- -D warnings
 cargo clippy -p renet-cross --target wasm32-unknown-unknown --no-default-features --locked -- -D warnings
 cargo check -p renet-cross --target wasm32-unknown-unknown --locked
+cargo clippy -p renet-cross --target wasm32-unknown-unknown --no-default-features --features packet-conditioner --locked -- -D warnings
+cargo check -p renet-cross --target wasm32-unknown-unknown --no-default-features --features bevy-debug-ui --locked
 git diff --check

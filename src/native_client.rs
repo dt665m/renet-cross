@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use crate::packet_io::{Direction, PacketGate};
 #[cfg(any(feature = "native-sync", feature = "native-async"))]
 use renet::ConnectionConfig;
 use renet::RenetClient;
@@ -61,6 +62,7 @@ pub struct UdpNetcodeClientTransport {
     // buffer silently truncates on Unix and can produce WSAEMSGSIZE on Windows.
     buffer: [u8; 65_535],
     max_datagrams_per_update: NonZeroUsize,
+    packets: PacketGate<SocketAddr>,
 }
 
 impl UdpNetcodeClientTransport {
@@ -77,6 +79,7 @@ impl UdpNetcodeClientTransport {
             netcode_client,
             buffer: [0; 65_535],
             max_datagrams_per_update: NonZeroUsize::new(256).unwrap(),
+            packets: PacketGate::default(),
         })
     }
 
@@ -85,12 +88,32 @@ impl UdpNetcodeClientTransport {
         self.max_datagrams_per_update = limit;
     }
 
+    fn flush_outgoing(&self) -> io::Result<()> {
+        for (addr, bytes) in self.packets.drain(Direction::Outgoing) {
+            if addr == self.netcode_client.server_addr() {
+                send_datagram(&self.socket, &bytes, addr)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn deliver_incoming(&mut self, client: &mut RenetClient) {
+        for (addr, mut bytes) in self.packets.drain(Direction::Incoming) {
+            if addr == self.netcode_client.server_addr()
+                && let Some(payload) = self.netcode_client.process_packet(&mut bytes)
+            {
+                client.process_packet(payload);
+            }
+        }
+    }
+
     pub fn update(
         &mut self,
         duration: Duration,
         client: &mut RenetClient,
     ) -> Result<(), NativeClientError> {
         if let Some(reason) = self.netcode_client.disconnect_reason() {
+            self.packets.reset();
             client.disconnect_due_to_transport();
             return Err(NativeClientError::Netcode(NetcodeError::Disconnected(
                 reason,
@@ -101,7 +124,7 @@ impl UdpNetcodeClientTransport {
             && !self.netcode_client.is_disconnected()
             && let Ok((addr, packet)) = self.netcode_client.disconnect()
         {
-            let _ = self.socket.send_to(packet, addr);
+            let _ = send_packet(&self.packets, &self.socket, packet, addr);
         }
 
         if self.netcode_client.is_connected() {
@@ -112,21 +135,31 @@ impl UdpNetcodeClientTransport {
 
         crate::udp_io::receive_with_budget(self.max_datagrams_per_update, || {
             let (len, source) = self.socket.recv_from(&mut self.buffer)?;
-            if source == self.netcode_client.server_addr()
-                && len <= NETCODE_MAX_PACKET_BYTES
-                && let Some(payload) = self.netcode_client.process_packet(&mut self.buffer[..len])
+            if source != self.netcode_client.server_addr() || len > NETCODE_MAX_PACKET_BYTES {
+                return Ok(());
+            }
+            if self
+                .packets
+                .defer(Direction::Incoming, source, &self.buffer[..len])
             {
+                return Ok(());
+            }
+            if let Some(payload) = self.netcode_client.process_packet(&mut self.buffer[..len]) {
                 client.process_packet(payload);
             }
             Ok(())
         })?;
 
+        self.flush_outgoing()?;
+        self.deliver_incoming(client);
+
         if let Some((packet, addr)) = self.netcode_client.update(duration) {
-            send_datagram(&self.socket, packet, addr)?;
+            send_packet(&self.packets, &self.socket, packet, addr)?;
         }
 
         // Reflect handshakes and timeouts in this call rather than one frame later.
         if let Some(reason) = self.netcode_client.disconnect_reason() {
+            self.packets.reset();
             client.disconnect_due_to_transport();
             return Err(NativeClientError::Netcode(NetcodeError::Disconnected(
                 reason,
@@ -141,19 +174,54 @@ impl UdpNetcodeClientTransport {
 
     pub fn send_packets(&mut self, client: &mut RenetClient) -> Result<(), NativeClientError> {
         if let Some(reason) = self.netcode_client.disconnect_reason() {
+            self.packets.reset();
             return Err(NativeClientError::Netcode(NetcodeError::Disconnected(
                 reason,
             )));
         }
 
+        self.flush_outgoing()?;
+
         let packets = client.get_packets_to_send();
         for packet in packets {
             let (addr, payload) = self.netcode_client.generate_payload_packet(&packet)?;
-            send_datagram(&self.socket, payload, addr)?;
+            send_packet(&self.packets, &self.socket, payload, addr)?;
         }
 
         Ok(())
     }
+}
+
+#[cfg(feature = "packet-conditioner")]
+impl UdpNetcodeClientTransport {
+    /// Attach a fresh session; one handle belongs to one live client.
+    pub fn set_conditioner(&mut self, handle: crate::conditioner::ConditionerHandle) {
+        self.packets.attach(handle);
+    }
+    pub fn conditioner(&self) -> Option<crate::conditioner::ConditionerHandle> {
+        self.packets.handle()
+    }
+    /// Discard queued packets and detach conditioning.
+    pub fn clear_conditioner(&mut self) {
+        self.packets.detach();
+    }
+}
+
+fn send_packet(
+    gate: &PacketGate<SocketAddr>,
+    socket: &UdpSocket,
+    bytes: &[u8],
+    addr: SocketAddr,
+) -> io::Result<()> {
+    if !gate.defer(Direction::Outgoing, addr, bytes) {
+        send_datagram(socket, bytes, addr)?;
+    }
+    for (destination, packet) in gate.drain(Direction::Outgoing) {
+        if destination == addr {
+            send_datagram(socket, &packet, destination)?;
+        }
+    }
+    Ok(())
 }
 
 fn send_datagram(socket: &UdpSocket, payload: &[u8], addr: SocketAddr) -> io::Result<()> {

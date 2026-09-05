@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 bevy = { version = "0.19.1", default-features = true, features = ["bevy_dev_tools"] }
-bevy_feathers = "0.19.1"
 shared = { path = "../shared" }
 log = "0.4.22"
 renet = "2.0.0"

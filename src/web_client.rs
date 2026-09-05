@@ -13,7 +13,9 @@ use web_sys::{
     RtcSessionDescriptionInit,
 };
 
+use crate::packet_io::{Direction, PacketGate};
 use crate::web_config::{PacketInbox, fits_send_budget};
+
 use crate::{SessionCreateResponse, WebRtcClientStats, WebRtcConnectOptions, WebRtcOptionsError};
 
 const ICE_GATHER_TIMEOUT_MS: u32 = 8_000;
@@ -79,6 +81,7 @@ pub struct WebRtcNetcodeClientTransport {
     netcode_client: NetcodeClient,
     inbox: Rc<RefCell<PacketInbox>>,
     max_buffered_amount: u32,
+    packets: PacketGate<()>,
     _on_message: Closure<dyn FnMut(MessageEvent)>,
 }
 
@@ -92,12 +95,59 @@ impl Drop for PeerGuard {
 
 impl Drop for WebRtcNetcodeClientTransport {
     fn drop(&mut self) {
+        self.clear_pending_packets();
         self.data_channel.set_onmessage(None);
         self.data_channel.close();
     }
 }
 
+#[cfg(feature = "packet-conditioner")]
 impl WebRtcNetcodeClientTransport {
+    /// Attach optional raw-packet conditioning before the first update to include
+    /// the netcode handshake. ICE/DTLS/SCTP establishment happens before this API.
+    /// Replacing a conditioner discards all locally pending packets.
+    pub fn set_conditioner(&mut self, handle: crate::conditioner::ConditionerHandle) {
+        self.clear_pending_packets();
+        self.packets.attach(handle);
+    }
+
+    /// Shared runtime configuration and statistics, independent of any UI.
+    pub fn conditioner(&self) -> Option<crate::conditioner::ConditionerHandle> {
+        self.packets.handle()
+    }
+
+    /// Detach conditioning and discard pending packets rather than releasing a burst.
+    pub fn clear_conditioner(&mut self) {
+        self.clear_pending_packets();
+        self.packets.detach();
+    }
+}
+
+impl WebRtcNetcodeClientTransport {
+    fn clear_pending_packets(&mut self) {
+        self.packets.reset();
+        while self.inbox.borrow_mut().pop().is_some() {}
+    }
+
+    fn deliver_pending_packets(
+        &mut self,
+        client: &mut RenetClient,
+    ) -> Result<(), WebRtcClientError> {
+        for ((), mut packet) in self.packets.drain(Direction::Incoming) {
+            if let Some(payload) = self.netcode_client.process_packet(&mut packet) {
+                client.process_packet(payload);
+            }
+        }
+        self.flush_pending_sends()
+    }
+
+    fn flush_pending_sends(&self) -> Result<(), WebRtcClientError> {
+        for ((), packet) in self.packets.drain(Direction::Outgoing) {
+            self.send_data_channel_packet_unconditioned(&packet)?;
+        }
+        Ok(())
+    }
+
     /// Local queue drop counters. Renet handles recovery of reliable messages.
     pub fn stats(&self) -> WebRtcClientStats {
         self.inbox.borrow().stats
@@ -109,6 +159,7 @@ impl WebRtcNetcodeClientTransport {
         client: &mut RenetClient,
     ) -> Result<(), WebRtcClientError> {
         if let Some(reason) = self.netcode_client.disconnect_reason() {
+            self.clear_pending_packets();
             client.disconnect_due_to_transport();
             return Err(WebRtcClientError::Netcode(NetcodeError::Disconnected(
                 reason,
@@ -121,17 +172,21 @@ impl WebRtcNetcodeClientTransport {
         {
             let packet = packet.to_vec();
             let _ = self.send_data_channel_packet(&packet);
+            self.clear_pending_packets();
         }
 
         if matches!(
             self.data_channel.ready_state(),
             RtcDataChannelState::Closing | RtcDataChannelState::Closed
         ) {
+            self.clear_pending_packets();
             client.disconnect_due_to_transport();
             return Err(WebRtcClientError::DataChannelState {
                 state: data_channel_state_label(self.data_channel.ready_state()),
             });
         }
+
+        self.deliver_pending_packets(client)?;
 
         while let Some(mut packet) = self.inbox.borrow_mut().pop() {
             if let Some(payload) = self.netcode_client.process_packet(&mut packet) {
@@ -149,6 +204,7 @@ impl WebRtcNetcodeClientTransport {
         }
 
         if let Some(reason) = self.netcode_client.disconnect_reason() {
+            self.clear_pending_packets();
             client.disconnect_due_to_transport();
             return Err(WebRtcClientError::Netcode(NetcodeError::Disconnected(
                 reason,
@@ -166,10 +222,13 @@ impl WebRtcNetcodeClientTransport {
 
     pub fn send_packets(&mut self, client: &mut RenetClient) -> Result<(), WebRtcClientError> {
         if let Some(reason) = self.netcode_client.disconnect_reason() {
+            self.clear_pending_packets();
             return Err(WebRtcClientError::Netcode(NetcodeError::Disconnected(
                 reason,
             )));
         }
+
+        self.flush_pending_sends()?;
 
         let packets = client.get_packets_to_send();
         for packet in packets {
@@ -187,6 +246,16 @@ impl WebRtcNetcodeClientTransport {
     }
 
     fn send_data_channel_packet(&self, payload: &[u8]) -> Result<(), WebRtcClientError> {
+        if !self.packets.defer(Direction::Outgoing, (), payload) {
+            self.send_data_channel_packet_unconditioned(payload)?;
+        }
+        self.flush_pending_sends()
+    }
+
+    fn send_data_channel_packet_unconditioned(
+        &self,
+        payload: &[u8],
+    ) -> Result<(), WebRtcClientError> {
         match self.data_channel.ready_state() {
             RtcDataChannelState::Open => {
                 if !fits_send_budget(
@@ -350,10 +419,15 @@ pub async fn connect_via_sdp_http_with_options(
 
     let inbox = Rc::new(RefCell::new(PacketInbox::new(options.max_inbox_packets)));
     let callback_inbox = Rc::clone(&inbox);
+    let packets = PacketGate::default();
+    let callback_packets = packets.clone();
     let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
         let mut inbox = callback_inbox.borrow_mut();
         if let Some(bytes) = message_bytes(&event, &mut inbox) {
             log::trace!("web data channel message bytes={}", bytes.len());
+            if callback_packets.defer(Direction::Incoming, (), &bytes) {
+                return;
+            }
             inbox.push(bytes);
         }
     }) as Box<dyn FnMut(MessageEvent)>);
@@ -395,6 +469,7 @@ pub async fn connect_via_sdp_http_with_options(
         netcode_client,
         inbox,
         max_buffered_amount: options.max_buffered_amount,
+        packets,
         _on_message: on_message,
     };
 

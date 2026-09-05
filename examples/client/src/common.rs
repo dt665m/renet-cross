@@ -6,12 +6,6 @@ use bevy::ecs::hierarchy::ChildSpawnerCommands;
 use bevy::log::{Level, LogPlugin};
 use bevy::prelude::*;
 use bevy::time::common_conditions::on_timer;
-use bevy_feathers::{
-    FeathersPlugins,
-    dark_theme::create_dark_theme,
-    theme::{ThemeBackgroundColor, ThemedText, UiTheme},
-    tokens,
-};
 #[cfg(not(target_arch = "wasm32"))]
 use clap::Parser;
 use renet::{DefaultChannel, RenetClient};
@@ -586,7 +580,6 @@ pub fn run() {
             filter: default_log_filter(),
             ..Default::default()
         }),
-        FeathersPlugins,
         FpsOverlayPlugin {
             config: FpsOverlayConfig {
                 text_config: TextFont {
@@ -604,7 +597,6 @@ pub fn run() {
             },
         },
     ))
-    .insert_resource(UiTheme(create_dark_theme()))
     .insert_resource(bevy::time::Time::<bevy::time::Fixed>::from_hz(
         CLIENT_PREDICTION_HZ,
     ))
@@ -713,18 +705,24 @@ fn spawn_network_panel(commands: &mut Commands) -> Entity {
                 padding: UiRect::all(Val::Px(6.0)),
                 ..Default::default()
             },
-            ThemeBackgroundColor(tokens::WINDOW_BG),
+            BackgroundColor(Color::srgba(0.08, 0.09, 0.12, 0.96)),
         ))
         .insert(NetDiagPanelRoot)
         .with_children(|parent| {
             parent.spawn((
                 Text::new("Net Diagnostics"),
-                ThemedText,
+                TextFont {
+                    font_size: FontSize::Px(14.0),
+                    ..Default::default()
+                },
                 TextColor(Color::srgb(0.95, 0.97, 1.0)),
             ));
             parent.spawn((
                 Text::new("bootstrapping..."),
-                ThemedText,
+                TextFont {
+                    font_size: FontSize::Px(14.0),
+                    ..Default::default()
+                },
                 TextColor(Color::srgb(0.72, 0.78, 0.9)),
                 NetStatsPanelText,
             ));
@@ -754,7 +752,10 @@ fn spawn_metric_section(
         .with_children(|metric| {
             metric.spawn((
                 Text::new(format!("{}: --", spec.label)),
-                ThemedText,
+                TextFont {
+                    font_size: FontSize::Px(14.0),
+                    ..Default::default()
+                },
                 TextColor(Color::srgb(
                     spec.value_color[0],
                     spec.value_color[1],

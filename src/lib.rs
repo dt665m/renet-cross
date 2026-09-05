@@ -1,6 +1,10 @@
 #[cfg(all(feature = "axum", not(target_arch = "wasm32")))]
 mod axum_bootstrap;
+#[cfg(feature = "bevy-debug-ui")]
+pub mod bevy_debug;
 mod bootstrap;
+#[cfg(feature = "packet-conditioner")]
+pub mod conditioner;
 #[cfg(not(target_arch = "wasm32"))]
 mod diagnostics;
 #[cfg(not(target_arch = "wasm32"))]
@@ -11,6 +15,7 @@ mod mixed_server;
 mod native_client;
 #[cfg(not(target_arch = "wasm32"))]
 mod netcode_result;
+mod packet_io;
 pub mod prelude;
 #[cfg(not(target_arch = "wasm32"))]
 mod sdp_http;

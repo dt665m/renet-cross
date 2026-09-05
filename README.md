@@ -271,3 +271,5 @@ The SDP helper counts pending negotiations toward the WebRTC backend's client
 capacity and returns HTTP 503 when full. Builder `max_clients` is per backend,
 not a combined mixed-server player limit. Low-level `add_peer` is an advanced
 API; callers are responsible for admission control when bypassing SDP helpers.
+
+Optional development tooling: [packet conditioner and Bevy debug UI](docs/conditioner-ui.md).

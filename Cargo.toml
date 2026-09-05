@@ -1,6 +1,6 @@
 [package]
 name = "renet-cross"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
 description = "renet udp / webrtc cross support"
@@ -21,8 +21,11 @@ native-sync = [
   "reqwest/json",
 ]
 native-async = ["dep:reqwest", "reqwest/default-tls", "reqwest/json"]
+packet-conditioner = []
+bevy-debug-ui = ["packet-conditioner", "dep:bevy"]
 
 [dependencies]
+bevy = { version = "0.18.1", optional = true, default-features = false, features = ["std", "bevy_ui", "bevy_text", "default_font"] }
 axum = { version = "0.8.8", optional = true }
 log = "0.4.22"
 renet = "2.0.0"
@@ -45,6 +48,8 @@ js-sys = "0.3.82"
 wasm-bindgen = "0.2.105"
 wasm-bindgen-futures = "0.4.55"
 web-sys = { version = "0.3.82", features = [
+  "Window",
+  "Performance",
   "Event",
   "MessageEvent",
   "RtcDataChannel",
