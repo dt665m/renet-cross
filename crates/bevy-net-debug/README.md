@@ -41,4 +41,5 @@ The panel supports Off, approximate 150/300 ms total RTT targets, custom added d
 
 Conditioning happens in `renet-cross`, below gameplay messages; the panel only controls its public API. Browser conditioning operates at the WebRTC DataChannel boundary and does not impair ICE/DTLS/SCTP establishment. Use the transport crate's headless API for server conditioning or applications without Bevy.
 
-Licensed under the repository's `LICENSE`; this package does not change those terms.
+Licensed under either the [MIT License](LICENSE-MIT) or the
+[Apache License, Version 2.0](LICENSE-APACHE), at your option.

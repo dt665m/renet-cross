@@ -289,3 +289,8 @@ Applications that want the built-in Bevy panel explicitly depend on the companio
 `bevy_net_debug::{ConditionerDebug, ConditionerDebugPlugin}`. Pass the same
 configured handle to the transport and panel. Headless consumers need only core.
 See the [migration and setup guide](docs/conditioner-ui.md).
+
+## License
+
+Licensed under either the [MIT License](LICENSE-MIT) or the
+[Apache License, Version 2.0](LICENSE-APACHE), at your option.

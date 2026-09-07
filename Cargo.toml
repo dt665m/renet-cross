@@ -4,7 +4,7 @@ version = "0.6.0"
 edition = "2024"
 rust-version = "1.88"
 description = "renet udp / webrtc cross support"
-license-file = "LICENSE"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/dt665m/renet-cross"
 
 [workspace]
