@@ -860,7 +860,7 @@ fn on_bootstrap_success(
     transport: PlatformTransport,
 ) {
     log::info!("{mode} client connected with client_id={client_id}");
-    world.insert_non_send_resource(ClientRuntime::new(client_id, renet, transport));
+    world.insert_non_send(ClientRuntime::new(client_id, renet, transport));
 }
 
 fn on_bootstrap_error(mode: &str, err: &str) {

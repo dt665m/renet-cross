@@ -1,4 +1,4 @@
-//! Optional Bevy 0.18 built-in UI for the client packet conditioner.
+//! Optional Bevy 0.19.1 built-in UI for the client packet conditioner.
 //!
 //! Add [`ConditionerDebugPlugin::new`] with the same handle attached to your
 //! transport. Your app supplies Bevy's UI/render plugins and a UI camera. After
@@ -203,7 +203,7 @@ fn spawn_panel(mut commands: Commands) {
                     header.spawn((
                         Text::new("Network conditioner"),
                         TextFont {
-                            font_size: 18.0,
+                            font_size: FontSize::Px(18.0),
                             ..default()
                         },
                     ));
@@ -211,7 +211,7 @@ fn spawn_panel(mut commands: Commands) {
                         Metric::Status,
                         Text::new("OFF"),
                         TextFont {
-                            font_size: 13.0,
+                            font_size: FontSize::Px(13.0),
                             ..default()
                         },
                         TextColor(Color::srgb(0.55, 0.85, 0.95)),
@@ -252,7 +252,7 @@ fn spawn_panel(mut commands: Commands) {
                                 card.spawn((
                                     Text::new(label),
                                     TextFont {
-                                        font_size: 11.0,
+                                        font_size: FontSize::Px(11.0),
                                         ..default()
                                     },
                                     TextColor(Color::srgb(0.65, 0.72, 0.82)),
@@ -261,7 +261,7 @@ fn spawn_panel(mut commands: Commands) {
                                     metric,
                                     Text::new("--"),
                                     TextFont {
-                                        font_size: 17.0,
+                                        font_size: FontSize::Px(17.0),
                                         ..default()
                                     },
                                 ));
@@ -271,7 +271,7 @@ fn spawn_panel(mut commands: Commands) {
             parent.spawn((
                 Text::new("Queues and drops"),
                 TextFont {
-                    font_size: 13.0,
+                    font_size: FontSize::Px(13.0),
                     ..default()
                 },
             ));
@@ -308,7 +308,7 @@ fn spawn_panel(mut commands: Commands) {
                         table.spawn((
                             Text::new(label),
                             TextFont {
-                                font_size: 11.0,
+                                font_size: FontSize::Px(11.0),
                                 ..default()
                             },
                             Node {
@@ -323,7 +323,7 @@ fn spawn_panel(mut commands: Commands) {
                         table.spawn((
                             Text::new(label),
                             TextFont {
-                                font_size: 11.0,
+                                font_size: FontSize::Px(11.0),
                                 ..default()
                             },
                             Node {
@@ -344,7 +344,7 @@ fn spawn_panel(mut commands: Commands) {
                                 metric,
                                 Text::new("0"),
                                 TextFont {
-                                    font_size: 11.0,
+                                    font_size: FontSize::Px(11.0),
                                     ..default()
                                 },
                                 Node {
@@ -360,7 +360,7 @@ fn spawn_panel(mut commands: Commands) {
                 Metric::Note,
                 Text::new(""),
                 TextFont {
-                    font_size: 12.0,
+                    font_size: FontSize::Px(12.0),
                     ..default()
                 },
                 TextColor(Color::srgb(0.95, 0.78, 0.45)),
@@ -409,7 +409,7 @@ fn spawn_panel(mut commands: Commands) {
                                     button.spawn((
                                         Text::new(label),
                                         TextFont {
-                                            font_size: 13.0,
+                                            font_size: FontSize::Px(13.0),
                                             ..default()
                                         },
                                     ));
@@ -420,7 +420,7 @@ fn spawn_panel(mut commands: Commands) {
             parent.spawn((
                 Text::new(PANEL_HELP),
                 TextFont {
-                    font_size: 11.0,
+                    font_size: FontSize::Px(11.0),
                     ..default()
                 },
                 TextColor(Color::srgb(0.65, 0.72, 0.82)),

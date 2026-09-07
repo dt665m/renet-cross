@@ -1,14 +1,14 @@
 # bevy-net-debug
 
-Optional Bevy 0.18 debug panel for `renet-cross` client packet conditioning. This separate crate uses Bevy's built-in UI and requires Rust 1.89 or newer. The transport crate has no Bevy dependency.
+Optional Bevy 0.19.1 debug panel for `renet-cross` client packet conditioning. This separate crate uses Bevy's built-in UI and requires Rust 1.95 or newer. The transport crate has no Bevy dependency.
 
 ```toml
 [dependencies]
 renet-cross = "0.6"
-bevy-net-debug = "0.1"
+bevy-net-debug = "0.2"
 ```
 
-Use Bevy 0.18 in the consuming application.
+Use Bevy 0.19.1 in the consuming application.
 
 Attach one shared control handle to the client transport and the plugin:
 

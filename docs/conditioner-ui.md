@@ -1,11 +1,11 @@
 # Optional Bevy network debug panel
 
-The Bevy **0.18** plugin lives in the separate `bevy-net-debug` workspace
+The Bevy **0.19.1** plugin lives in the separate `bevy-net-debug` workspace
 crate. The `renet-cross` transport crate has no Bevy dependency, even with all
 its features enabled. Packet tooling is always available through runtime config;
 no `packet-conditioner` or `bevy-debug-ui` Cargo feature is needed or provided.
-Use `renet-cross = "0.6"` and `bevy-net-debug = "0.1"`.
-The companion requires Rust 1.89; core retains its Rust 1.88 declaration.
+Use `renet-cross = "0.6"` and `bevy-net-debug = "0.2"`.
+The companion requires Rust 1.95; core retains its Rust 1.88 declaration.
 
 ```rust,ignore
 use renet_cross::{ClientTransportConfig, conditioner::ConditionerHandle};
