@@ -35,3 +35,15 @@ pub use crate::{
 };
 
 pub use crate::{WebRtcClientStats, WebRtcConnectOptions, WebRtcIceServer, WebRtcOptionsError};
+
+pub use crate::{
+    ClientTransportConfig,
+    conditioner::{ConditionerConfig, ConditionerHandle, ConditionerStats},
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use crate::{
+    ServerTransportConfig,
+    server_conditioner::{
+        ServerConditionerConfig, ServerConditionerHandle, ServerConditionerStats, ServerPeerId,
+    },
+};

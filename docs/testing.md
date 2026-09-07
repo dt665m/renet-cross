@@ -12,9 +12,10 @@ Install the browser compilation target first if missing:
 rustup target add wasm32-unknown-unknown
 ```
 
-The script checks the library package, not the Bevy demo workspace. Tests need
+The script checks the transport and Bevy companion packages, not the Bevy demo workspace. Tests need
 loopback UDP sockets but no public network, browser, STUN/TURN service, game
-assets, wall-clock sleeps, or credentials. Dependencies must already be cached
+assets, credentials. The server-conditioner RTT integration test uses six seconds of real
+wall time; the fault-proxy and scheduler tests use simulated time. Dependencies must already be cached
 for offline use. Cargo.lock fixes the dependency resolution; CI checks native
 transports on Linux, macOS, and Windows and compiles/lints the wasm library.
 

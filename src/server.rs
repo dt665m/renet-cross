@@ -16,6 +16,7 @@ use str0m::{
 use crate::{
     TransportError,
     netcode_result::{OwnedServerResult, to_owned_server_result},
+    packet_io::{Direction, ServerPacketGate, ServerPeerId},
 };
 
 const WEBRTC_RECV_BUFFER_BYTES: usize = 65_535;
@@ -86,6 +87,7 @@ pub struct WebRtcNetcodeServerTransport {
     pending_server_results: Vec<OwnedServerResult>,
     send_payload_scratch: Vec<u8>,
     buffer: [u8; WEBRTC_RECV_BUFFER_BYTES],
+    packet_gate: ServerPacketGate,
 }
 
 fn virtual_addr_for_client(client_id: ClientId) -> SocketAddr {
@@ -101,6 +103,15 @@ fn virtual_addr_for_client(client_id: ClientId) -> SocketAddr {
 
 impl WebRtcNetcodeServerTransport {
     pub fn new(server_config: ServerConfig, socket: UdpSocket) -> Result<Self, io::Error> {
+        Self::new_with_config(server_config, socket, Default::default())
+    }
+
+    /// Install runtime packet controls before accepting clients.
+    pub fn new_with_config(
+        server_config: ServerConfig,
+        socket: UdpSocket,
+        config: crate::ServerTransportConfig,
+    ) -> Result<Self, io::Error> {
         socket.set_nonblocking(true)?;
         let receive_destination = server_config
             .public_addresses
@@ -109,6 +120,10 @@ impl WebRtcNetcodeServerTransport {
             .unwrap_or(socket.local_addr()?);
         let netcode_server = NetcodeServer::new(server_config);
 
+        let mut packet_gate = ServerPacketGate::default();
+        if let Some(handle) = config.conditioner {
+            packet_gate.attach(handle);
+        }
         Ok(Self {
             socket,
             netcode_server,
@@ -120,6 +135,7 @@ impl WebRtcNetcodeServerTransport {
             pending_server_results: Vec::new(),
             send_payload_scratch: Vec::with_capacity(NETCODE_MAX_PACKET_BYTES),
             buffer: [0; WEBRTC_RECV_BUFFER_BYTES],
+            packet_gate,
         })
     }
 
@@ -135,6 +151,7 @@ impl WebRtcNetcodeServerTransport {
     /// Remove a peer and release its netcode slot immediately. The shared Renet
     /// connection is removed on the next update or send_packets call.
     pub fn remove_peer(&mut self, client_id: ClientId) -> Option<ServerPeer> {
+        self.packet_gate.remove(ServerPeerId::WebRtc(client_id));
         self.addr_to_client_id
             .retain(|_, value| *value != client_id);
         let _ = self.netcode_server.disconnect(client_id);
@@ -204,6 +221,7 @@ impl WebRtcNetcodeServerTransport {
         // Half-open ICE/DTLS sessions have no netcode client yet.
         self.peers.clear();
         self.addr_to_client_id.clear();
+        self.packet_gate.reset();
         self.apply_pending_results(server);
     }
 
@@ -223,6 +241,7 @@ impl WebRtcNetcodeServerTransport {
     ) -> Result<(), TransportError> {
         self.apply_pending_results(server);
         self.netcode_server.update(duration);
+        self.drain_conditioned_packets(server);
         // Peers supplied by signaling can already have output pending.
         for client_id in self.peers.keys().copied().collect::<Vec<_>>() {
             self.flush_peer_output(client_id);
@@ -265,11 +284,13 @@ impl WebRtcNetcodeServerTransport {
         }
 
         self.apply_pending_results(server);
+        self.drain_conditioned_packets(server);
         Ok(())
     }
 
     pub fn send_packets(&mut self, server: &mut RenetServer) {
         self.apply_pending_results(server);
+        self.drain_conditioned_packets(server);
         for client_id in self.netcode_server.clients_id() {
             let packets = match server.get_packets_to_send(client_id) {
                 Ok(value) => value,
@@ -304,6 +325,7 @@ impl WebRtcNetcodeServerTransport {
         }
 
         self.apply_pending_results(server);
+        self.drain_conditioned_packets(server);
     }
 
     fn apply_pending_results(&mut self, server: &mut RenetServer) {
@@ -336,6 +358,7 @@ impl WebRtcNetcodeServerTransport {
         if peer.rtc.is_alive() {
             self.peers.insert(client_id, peer);
         } else {
+            self.packet_gate.remove(ServerPeerId::WebRtc(client_id));
             self.addr_to_client_id
                 .retain(|_, value| *value != client_id);
             let result = self.netcode_server.disconnect(client_id);
@@ -487,28 +510,15 @@ impl WebRtcNetcodeServerTransport {
                     return;
                 }
 
-                let source_addr = peer.virtual_addr();
-                log::trace!(
-                    "webrtc channel data client_id={} bytes={} binary={}",
-                    peer.client_id,
-                    data.data.len(),
-                    data.binary
-                );
-
-                let mut packet = data.data;
-                let result = self.netcode_server.process_packet(source_addr, &mut packet);
-                let result = to_owned_server_result(result);
-                if let OwnedServerResult::ClientConnected { client_id, .. } = &result
-                    && *client_id != peer.client_id
-                {
-                    // The netcode identity must belong to the signaling peer. Never
-                    // let a packet overwrite another peer's virtual address route.
-                    let claimed_id = *client_id;
-                    let _ = self.netcode_server.disconnect(claimed_id);
-                    peer.rtc.disconnect();
-                    return;
+                // Condition encrypted netcode packets, not ICE/DTLS/SCTP control
+                // traffic. Every peer has an independent packet queue.
+                if !self.packet_gate.defer(
+                    Direction::Incoming,
+                    ServerPeerId::WebRtc(peer.client_id),
+                    &data.data,
+                ) {
+                    self.process_peer_packet(peer, data.data, pending_server_results);
                 }
-                pending_server_results.push(result);
             }
             Event::IceConnectionStateChange(state) => {
                 if state == IceConnectionState::Disconnected {
@@ -529,6 +539,56 @@ impl WebRtcNetcodeServerTransport {
             }
             _ => {}
         }
+    }
+
+    fn process_peer_packet(
+        &mut self,
+        peer: &mut ServerPeer,
+        mut packet: Vec<u8>,
+        pending_server_results: &mut Vec<OwnedServerResult>,
+    ) {
+        let result = self
+            .netcode_server
+            .process_packet(peer.virtual_addr(), &mut packet);
+        let result = to_owned_server_result(result);
+        if let OwnedServerResult::ClientConnected { client_id, .. } = &result
+            && *client_id != peer.client_id
+        {
+            // Apply exactly the same identity validation to delayed and immediate
+            // packets. A signaling peer cannot claim another netcode identity.
+            let _ = self.netcode_server.disconnect(*client_id);
+            peer.rtc.disconnect();
+            return;
+        }
+        pending_server_results.push(result);
+    }
+
+    fn drain_conditioned_packets(&mut self, server: &mut RenetServer) {
+        for (id, packet) in self.packet_gate.drain(Direction::Incoming) {
+            let ServerPeerId::WebRtc(client_id) = id else {
+                continue;
+            };
+            let Some(mut peer) = self.peers.remove(&client_id) else {
+                continue;
+            };
+            let mut results = Vec::new();
+            if peer.rtc.is_alive() {
+                self.process_peer_packet(&mut peer, packet, &mut results);
+            }
+            self.pending_server_results.extend(results);
+            self.peers.insert(client_id, peer);
+            self.flush_peer_output(client_id);
+            self.apply_pending_results(server);
+        }
+        for (id, packet) in self.packet_gate.drain(Direction::Outgoing) {
+            let ServerPeerId::WebRtc(client_id) = id else {
+                continue;
+            };
+            if let Err(err) = self.send_to_peer_unconditioned(client_id, &packet) {
+                log::debug!("Failed to send conditioned packet to peer {client_id}: {err}");
+            }
+        }
+        self.apply_pending_results(server);
     }
 
     fn handle_server_result(&mut self, server_result: OwnedServerResult, server: &mut RenetServer) {
@@ -593,6 +653,7 @@ impl WebRtcNetcodeServerTransport {
                 self.addr_to_client_id
                     .retain(|_, value| *value != client_id);
                 self.peers.remove(&client_id);
+                self.packet_gate.remove(ServerPeerId::WebRtc(client_id));
             }
         }
     }
@@ -604,6 +665,24 @@ impl WebRtcNetcodeServerTransport {
     }
 
     fn send_to_peer(&mut self, client_id: ClientId, payload: &[u8]) -> Result<(), TransportError> {
+        if !self.peers.contains_key(&client_id) {
+            return Err(TransportError::MissingPeer { client_id });
+        }
+        if self.packet_gate.defer(
+            Direction::Outgoing,
+            ServerPeerId::WebRtc(client_id),
+            payload,
+        ) {
+            return Ok(());
+        }
+        self.send_to_peer_unconditioned(client_id, payload)
+    }
+
+    fn send_to_peer_unconditioned(
+        &mut self,
+        client_id: ClientId,
+        payload: &[u8],
+    ) -> Result<(), TransportError> {
         self.flush_peer_output(client_id);
         let peer = self
             .peers
@@ -627,6 +706,22 @@ impl WebRtcNetcodeServerTransport {
         }
 
         Ok(())
+    }
+}
+
+impl WebRtcNetcodeServerTransport {
+    /// Apply one server configuration to independent per-peer netcode queues.
+    pub fn set_conditioner(&mut self, handle: crate::server_conditioner::ServerConditionerHandle) {
+        self.packet_gate.attach(handle);
+    }
+
+    pub fn conditioner(&self) -> Option<crate::server_conditioner::ServerConditionerHandle> {
+        self.packet_gate.handle()
+    }
+
+    /// Discard queued packets and resume normal transmission.
+    pub fn clear_conditioner(&mut self) {
+        self.packet_gate.detach();
     }
 }
 

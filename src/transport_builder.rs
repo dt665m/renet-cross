@@ -16,6 +16,7 @@ pub struct MixedTransportBuilder {
     public_webrtc_addr: Option<SocketAddr>,
     max_clients: usize,
     authentication: ServerAuthentication,
+    transport: crate::ServerTransportConfig,
 }
 
 impl MixedTransportBuilder {
@@ -28,6 +29,7 @@ impl MixedTransportBuilder {
             public_webrtc_addr: None,
             max_clients: 512,
             authentication: ServerAuthentication::Unsecure,
+            transport: Default::default(),
         }
     }
 
@@ -61,6 +63,12 @@ impl MixedTransportBuilder {
         self
     }
 
+    /// Shared packet policy applied to UDP and WebRTC before accepting clients.
+    pub fn transport_config(mut self, config: crate::ServerTransportConfig) -> Self {
+        self.transport = config;
+        self
+    }
+
     pub fn build(self) -> Result<MixedServerTransport, TransportError> {
         let current_time = unix_now_duration()
             .map_err(|err| io::Error::other(format!("failed to read unix timestamp: {err}")))?;
@@ -71,7 +79,7 @@ impl MixedTransportBuilder {
         let default_public_udp_addr = udp_socket.local_addr()?;
         let public_udp_addr = self.public_udp_addr.unwrap_or(default_public_udp_addr);
 
-        let udp_transport = UdpNetcodeServerTransport::new(
+        let udp_transport = UdpNetcodeServerTransport::new_with_config(
             ServerConfig {
                 current_time,
                 max_clients: self.max_clients,
@@ -80,6 +88,7 @@ impl MixedTransportBuilder {
                 authentication: auth_for_udp,
             },
             udp_socket,
+            self.transport.clone(),
         )?;
 
         let webrtc_socket = UdpSocket::bind(self.webrtc_bind)?;
@@ -88,7 +97,7 @@ impl MixedTransportBuilder {
             .public_webrtc_addr
             .unwrap_or(default_public_webrtc_addr);
 
-        let webrtc_transport = WebRtcNetcodeServerTransport::new(
+        let webrtc_transport = WebRtcNetcodeServerTransport::new_with_config(
             ServerConfig {
                 current_time,
                 max_clients: self.max_clients,
@@ -97,6 +106,7 @@ impl MixedTransportBuilder {
                 authentication: auth_for_webrtc,
             },
             webrtc_socket,
+            self.transport,
         )?;
 
         Ok(MixedServerTransport::new(udp_transport, webrtc_transport))

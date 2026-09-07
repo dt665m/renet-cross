@@ -1,15 +1,29 @@
 # Optional Bevy network debug panel
 
-Enable `bevy-debug-ui` on `renet-cross` to import the Bevy **0.18** plugin. It uses only Bevy's built-in `Node`, `Text`, and `Button` components. Transport-only users can enable `packet-conditioner` without depending on Bevy. The existing game example remains on Bevy 0.19 and uses built-in UI for its FPS overlay, network metrics, and graphs.
+The Bevy **0.18** plugin lives in the separate `bevy-net-debug` workspace
+crate. The `renet-cross` transport crate has no Bevy dependency, even with all
+its features enabled. Packet tooling is always available through runtime config;
+no `packet-conditioner` or `bevy-debug-ui` Cargo feature is needed or provided.
+Use `renet-cross = "0.6"` and `bevy-net-debug = "0.1"`.
+The companion requires Rust 1.89; core retains its Rust 1.88 declaration.
 
 ```rust,ignore
-use renet_cross::conditioner::ConditionerHandle;
-use renet_cross::bevy_debug::{ConditionerDebug, ConditionerDebugPlugin};
+use renet_cross::{ClientTransportConfig, conditioner::ConditionerHandle};
+use bevy_net_debug::{ConditionerDebug, ConditionerDebugPlugin};
 
 let handle = ConditionerHandle::default();
-transport.set_conditioner(handle.clone());
+let config = ClientTransportConfig { conditioner: Some(handle.clone()) };
+let transport = UdpNetcodeClientTransport::new_with_config(
+    current_time, authentication, socket, config,
+)?;
 app.add_plugins(ConditionerDebugPlugin::new(handle));
 ```
+
+For HTTP/bootstrap helpers set `NativeConnectOptions.transport` or
+`WebRtcConnectOptions.transport` to that same config. The handle is installed
+before the first netcode handshake. None is the default passthrough; a disabled
+handle permits later runtime configuration. Its stats describe conditioner
+queues/drops, not a packet capture or a measurement of real network loss.
 
 Use the same handle attached to your native or browser transport. Your application supplies its usual Bevy UI/render plugins and camera. This plugin does not install `DefaultPlugins` or spawn a camera. Its panel appears at the top right; set the `ConditionerDebug` resource's `visible` field to false to hide it without changing conditioning.
 
@@ -37,12 +51,10 @@ The browser boundary delays complete DataChannel messages carrying Renet/netcode
 ## Internal structure
 
 Transport pumps call the private `packet_io::PacketGate` interface for raw packet
-interception, draining, and session cleanup. `packet_io/mod.rs` selects either the
-conditioned implementation or a zero-sized, allocation-free passthrough at compile
-time. Scheduling, clocks, shared state, and queue lifecycle live behind that
-interface. Each transport has one feature-gated extension impl for its public
-conditioner controls; receive/send loops contain no conditioner feature guards.
+interception, draining, and session cleanup. The adapter uses runtime controls;
+there is no conditioner feature selection or duplicate disabled implementation.
+It shares state with browser callbacks and preserves native `Send + Sync`.
+Dropping its last owner clears externally visible queue statistics. The UI crate
+uses only public transport controls and receives measured Renet RTT from the app.
 
-The enabled adapter shares its state with browser callbacks and preserves native
-`Send + Sync`. Dropping its last owner clears externally visible queue statistics.
-The feature is optional; these APIs are available starting with 0.5.0.
+The panel uses individual ECS metric cards and aligned Incoming/Outgoing queue and drop cells. It wraps within 95% of viewport width, is capped at 94% of viewport height, and scrolls with the mouse wheel over the panel when needed. Labels use ASCII for default-font compatibility; hiding the panel does not change network settings.

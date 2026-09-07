@@ -23,10 +23,12 @@ jobs:
       - name: Formatting and native lint
         if: runner.os == 'Linux'
         run: |
-          cargo fmt -p renet-cross --check
+          cargo fmt -p renet-cross -p bevy-net-debug --check
           cargo clippy -p renet-cross --lib --tests --all-features --locked -- -D warnings
       - name: Native transport regressions (no browser or public network)
         run: cargo test -p renet-cross --all-features --locked
+      - name: Bevy companion tests
+        run: cargo test -p bevy-net-debug --locked
       - name: Transport without HTTP clients
         run: cargo test -p renet-cross --no-default-features --locked
 
@@ -41,6 +43,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Browser library and lint
         run: cargo clippy -p renet-cross --target wasm32-unknown-unknown --no-default-features --locked -- -D warnings
+      - name: Bevy browser companion
+        run: cargo clippy -p bevy-net-debug --target wasm32-unknown-unknown --locked -- -D warnings
       - name: Browser library with default features
         run: cargo check -p renet-cross --target wasm32-unknown-unknown --locked
 

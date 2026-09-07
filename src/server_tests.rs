@@ -585,3 +585,131 @@ fn replacing_peer_releases_netcode_slot_without_removing_replacement() {
         Some(&42)
     );
 }
+
+mod conditioning {
+    use super::*;
+    use crate::{
+        conditioner::ConditionerConfig,
+        server_conditioner::{ServerConditionerConfig, ServerConditionerHandle},
+    };
+
+    fn settings(latency: Duration, loss: f32) -> ServerConditionerConfig {
+        ServerConditionerConfig {
+            packets: ConditionerConfig {
+                enabled: true,
+                latency,
+                packet_loss: loss,
+                seed: 42,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn server_conditioning_leaves_ice_running_and_can_restore_netcode_delivery() {
+        let mut harness = Harness::new(42, 42);
+        let handle = ServerConditionerHandle::new(settings(Duration::ZERO, 1.0)).unwrap();
+        harness.transport.set_conditioner(handle.clone());
+        for _ in 0..100 {
+            harness.step();
+        }
+        assert!(
+            harness.channel_open,
+            "ICE/DTLS/SCTP control traffic must bypass netcode conditioning"
+        );
+        assert!(!harness.server.is_connected(42));
+        assert!(handle.stats().packets.incoming.simulated_loss_drops > 0);
+        handle.configure(settings(Duration::ZERO, 0.0)).unwrap();
+        harness.connect();
+        harness.client.send_message(
+            DefaultChannel::ReliableOrdered,
+            b"conditioned input".to_vec(),
+        );
+        harness.server.send_message(
+            42,
+            DefaultChannel::ReliableOrdered,
+            b"conditioned snapshot".to_vec(),
+        );
+        for _ in 0..100 {
+            harness.step();
+        }
+        assert_eq!(
+            harness
+                .server
+                .receive_message(42, DefaultChannel::ReliableOrdered)
+                .unwrap()
+                .as_ref(),
+            b"conditioned input"
+        );
+        assert_eq!(
+            harness
+                .client
+                .receive_message(DefaultChannel::ReliableOrdered)
+                .unwrap()
+                .as_ref(),
+            b"conditioned snapshot"
+        );
+        assert!(harness.transport.conditioner().is_some());
+        harness.transport.clear_conditioner();
+        assert!(harness.transport.conditioner().is_none());
+        assert_eq!(handle.stats().peers, 0);
+    }
+
+    #[test]
+    fn conditioned_handshake_keeps_signaling_identity_validation() {
+        let mut harness = Harness::new(42, 99);
+        let handle = ServerConditionerHandle::new(settings(Duration::ZERO, 0.0)).unwrap();
+        harness.transport.set_conditioner(handle.clone());
+        for _ in 0..300 {
+            harness.step();
+        }
+        assert!(!harness.server.is_connected(42));
+        assert!(!harness.server.is_connected(99));
+        assert_eq!(harness.transport.connected_clients(), 0);
+        assert!(harness.transport.peer(42).is_none());
+        assert_eq!(handle.stats().peers, 0);
+    }
+
+    #[test]
+    fn replacing_conditioned_peer_discards_both_packet_queues() {
+        let mut harness = Harness::new(42, 42);
+        harness.connect();
+        let handle = ServerConditionerHandle::new(settings(Duration::from_secs(60), 0.0)).unwrap();
+        harness.transport.set_conditioner(handle.clone());
+        harness
+            .client
+            .send_message(DefaultChannel::ReliableOrdered, b"old input".to_vec());
+        harness.server.send_message(
+            42,
+            DefaultChannel::ReliableOrdered,
+            b"old snapshot".to_vec(),
+        );
+        for _ in 0..50 {
+            harness.step();
+            let stats = handle.stats().packets;
+            if stats.incoming.queued_packets > 0 && stats.outgoing.queued_packets > 0 {
+                break;
+            }
+        }
+        let stats = handle.stats().packets;
+        assert!(stats.incoming.queued_packets > 0);
+        assert!(stats.outgoing.queued_packets > 0);
+        harness.transport.add_peer(42, Rtc::new(harness.now));
+        assert_eq!(handle.stats().peers, 0);
+        assert_eq!(handle.stats().packets.incoming.queued_packets, 0);
+        assert_eq!(handle.stats().packets.outgoing.queued_packets, 0);
+        harness
+            .transport
+            .update_at(Duration::ZERO, &mut harness.server, harness.now)
+            .unwrap();
+        assert!(harness.transport.peer(42).is_some());
+        assert!(!harness.server.is_connected(42));
+        assert!(
+            harness
+                .server
+                .receive_message(42, DefaultChannel::ReliableOrdered)
+                .is_none()
+        );
+    }
+}

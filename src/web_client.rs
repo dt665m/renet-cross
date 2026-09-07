@@ -101,7 +101,6 @@ impl Drop for WebRtcNetcodeClientTransport {
     }
 }
 
-#[cfg(feature = "packet-conditioner")]
 impl WebRtcNetcodeClientTransport {
     /// Attach optional raw-packet conditioning before the first update to include
     /// the netcode handshake. ICE/DTLS/SCTP establishment happens before this API.
@@ -420,6 +419,9 @@ pub async fn connect_via_sdp_http_with_options(
     let inbox = Rc::new(RefCell::new(PacketInbox::new(options.max_inbox_packets)));
     let callback_inbox = Rc::clone(&inbox);
     let packets = PacketGate::default();
+    if let Some(handle) = options.transport.conditioner {
+        packets.attach(handle);
+    }
     let callback_packets = packets.clone();
     let on_message = Closure::wrap(Box::new(move |event: MessageEvent| {
         let mut inbox = callback_inbox.borrow_mut();

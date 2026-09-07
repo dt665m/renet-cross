@@ -26,7 +26,7 @@ This crate intentionally does **not** re-export `renet`. Users should depend on 
 ```toml
 [dependencies]
 renet = "2"
-renet-cross = "0.4"
+renet-cross = "0.6"
 ```
 
 ### Server setup helper
@@ -273,3 +273,19 @@ not a combined mixed-server player limit. Low-level `add_peer` is an advanced
 API; callers are responsible for admission control when bypassing SDP helpers.
 
 Optional development tooling: [packet conditioner and Bevy debug UI](docs/conditioner-ui.md).
+
+Development server controls: [server packet conditioning](docs/server-conditioner.md).
+
+## Runtime packet tooling and Bevy UI
+
+Starting with 0.6.0, `renet-cross` has no Bevy dependency. Packet
+conditioning is configured at runtime via `ClientTransportConfig` or
+`ServerTransportConfig`; the old conditioner/UI Cargo features are removed.
+Use `new_with_config` on standalone transports, `.transport` on client bootstrap
+options, or `.transport_config(...)` on `MixedTransportBuilder`.
+
+Applications that want the built-in Bevy panel explicitly depend on the companion
+[`bevy-net-debug`](crates/bevy-net-debug) crate and import
+`bevy_net_debug::{ConditionerDebug, ConditionerDebugPlugin}`. Pass the same
+configured handle to the transport and panel. Headless consumers need only core.
+See the [migration and setup guide](docs/conditioner-ui.md).

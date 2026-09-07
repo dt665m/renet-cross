@@ -53,3 +53,16 @@ impl MixedServerTransport {
         self.webrtc.send_packets(server);
     }
 }
+
+impl MixedServerTransport {
+    /// Share policy and telemetry across both backends, with independent peer queues.
+    pub fn set_conditioner(&mut self, handle: crate::server_conditioner::ServerConditionerHandle) {
+        self.udp.set_conditioner(handle.clone());
+        self.webrtc.set_conditioner(handle);
+    }
+
+    pub fn clear_conditioner(&mut self) {
+        self.udp.clear_conditioner();
+        self.webrtc.clear_conditioner();
+    }
+}

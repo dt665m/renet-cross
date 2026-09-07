@@ -1,6 +1,6 @@
 [package]
 name = "renet-cross"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.88"
 description = "renet udp / webrtc cross support"
@@ -8,7 +8,7 @@ license-file = "LICENSE"
 repository = "https://github.com/dt665m/renet-cross"
 
 [workspace]
-members = ["examples/shared", "examples/server", "examples/client"]
+members = ["crates/bevy-net-debug", "examples/shared", "examples/server", "examples/client"]
 resolver = "2"
 
 [features]
@@ -21,11 +21,8 @@ native-sync = [
   "reqwest/json",
 ]
 native-async = ["dep:reqwest", "reqwest/default-tls", "reqwest/json"]
-packet-conditioner = []
-bevy-debug-ui = ["packet-conditioner", "dep:bevy"]
 
 [dependencies]
-bevy = { version = "0.18.1", optional = true, default-features = false, features = ["std", "bevy_ui", "bevy_text", "default_font"] }
 axum = { version = "0.8.8", optional = true }
 log = "0.4.22"
 renet = "2.0.0"

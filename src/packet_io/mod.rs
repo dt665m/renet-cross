@@ -1,7 +1,5 @@
-//! Raw-packet interception, selected once at compile time.
-//!
-//! Transport pumps use the same interface with or without impairment support.
-//! The disabled implementation is allocation-free and occupies no storage.
+//! Runtime packet interception shared by native and browser transports.
+//! No UI dependency or feature selection; absent controls pass packets through.
 
 #[derive(Clone, Copy)]
 pub(crate) enum Direction {
@@ -9,11 +7,18 @@ pub(crate) enum Direction {
     Outgoing,
 }
 
-#[cfg(feature = "packet-conditioner")]
-mod enabled;
-#[cfg(feature = "packet-conditioner")]
-pub(crate) use enabled::PacketGate;
-#[cfg(not(feature = "packet-conditioner"))]
-mod disabled;
-#[cfg(not(feature = "packet-conditioner"))]
-pub(crate) use disabled::PacketGate;
+mod client;
+pub(crate) use client::PacketGate;
+
+/// Transport-specific identity used to isolate server packet conditioning queues.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ServerPeerId {
+    Udp(std::net::SocketAddr),
+    WebRtc(u64),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+mod server;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use server::ServerPacketGate;

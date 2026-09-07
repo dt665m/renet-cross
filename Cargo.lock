@@ -621,6 +621,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bevy-net-debug"
+version = "0.1.0"
+dependencies = [
+ "bevy 0.18.1",
+ "renet-cross",
+]
+
+[[package]]
 name = "bevy_a11y"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6694,10 +6702,9 @@ dependencies = [
 
 [[package]]
 name = "renet-cross"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "axum",
- "bevy 0.18.1",
  "getrandom 0.2.17",
  "gloo-net",
  "gloo-timers",

@@ -43,6 +43,7 @@ pub enum NativeClientError {
 pub struct NativeConnectOptions {
     pub udp_bind: SocketAddr,
     pub override_udp_addr: Option<SocketAddr>,
+    pub transport: crate::ClientTransportConfig,
 }
 
 impl Default for NativeConnectOptions {
@@ -50,6 +51,7 @@ impl Default for NativeConnectOptions {
         Self {
             udp_bind: SocketAddr::from(([0, 0, 0, 0], 0)),
             override_udp_addr: None,
+            transport: Default::default(),
         }
     }
 }
@@ -71,15 +73,29 @@ impl UdpNetcodeClientTransport {
         authentication: ClientAuthentication,
         socket: UdpSocket,
     ) -> Result<Self, NativeClientError> {
+        Self::new_with_config(current_time, authentication, socket, Default::default())
+    }
+
+    /// Construct with runtime packet controls installed before any handshake.
+    pub fn new_with_config(
+        current_time: Duration,
+        authentication: ClientAuthentication,
+        socket: UdpSocket,
+        config: crate::ClientTransportConfig,
+    ) -> Result<Self, NativeClientError> {
         socket.set_nonblocking(true)?;
         let netcode_client = NetcodeClient::new(current_time, authentication)?;
 
+        let packets = PacketGate::default();
+        if let Some(handle) = config.conditioner {
+            packets.attach(handle);
+        }
         Ok(Self {
             socket,
             netcode_client,
             buffer: [0; 65_535],
             max_datagrams_per_update: NonZeroUsize::new(256).unwrap(),
-            packets: PacketGate::default(),
+            packets,
         })
     }
 
@@ -192,7 +208,6 @@ impl UdpNetcodeClientTransport {
     }
 }
 
-#[cfg(feature = "packet-conditioner")]
 impl UdpNetcodeClientTransport {
     /// Attach a fresh session; one handle belongs to one live client.
     pub fn set_conditioner(&mut self, handle: crate::conditioner::ConditionerHandle) {
@@ -307,7 +322,8 @@ fn connect_from_session(
     };
 
     let socket = UdpSocket::bind(options.udp_bind)?;
-    let transport = UdpNetcodeClientTransport::new(now, authentication, socket)?;
+    let transport =
+        UdpNetcodeClientTransport::new_with_config(now, authentication, socket, options.transport)?;
     let client = RenetClient::new(ConnectionConfig::default());
 
     Ok((client, transport, session.client_id))

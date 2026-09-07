@@ -1,9 +1,6 @@
 #[cfg(all(feature = "axum", not(target_arch = "wasm32")))]
 mod axum_bootstrap;
-#[cfg(feature = "bevy-debug-ui")]
-pub mod bevy_debug;
 mod bootstrap;
-#[cfg(feature = "packet-conditioner")]
 pub mod conditioner;
 #[cfg(not(target_arch = "wasm32"))]
 mod diagnostics;
@@ -21,6 +18,8 @@ pub mod prelude;
 mod sdp_http;
 #[cfg(not(target_arch = "wasm32"))]
 mod server;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod server_conditioner;
 #[cfg(not(target_arch = "wasm32"))]
 mod transport_builder;
 #[cfg(not(target_arch = "wasm32"))]
@@ -85,3 +84,8 @@ pub use renetcode::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use str0m::{Rtc, channel::ChannelId};
+
+mod transport_config;
+pub use transport_config::ClientTransportConfig;
+#[cfg(not(target_arch = "wasm32"))]
+pub use transport_config::ServerTransportConfig;
