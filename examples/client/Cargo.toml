@@ -8,7 +8,7 @@ edition = "2024"
 bevy = { version = "0.19.1", default-features = true, features = ["bevy_dev_tools"] }
 shared = { path = "../shared" }
 log = "0.4.22"
-renet = "2.0.0"
+renet = { package = "renet-cross-core", path = "../../crates/renet-cross-core", version = "0.1.0" }
 renet_cross = { package = "renet-cross", path = "../.." }
 renetcode = "2.0.0"
 

@@ -1,6 +1,6 @@
 [package]
 name = "renet-cross"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.88"
 description = "renet udp / webrtc cross support"
@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/dt665m/renet-cross"
 
 [workspace]
-members = ["crates/bevy-net-debug", "examples/shared", "examples/server", "examples/client"]
+members = ["crates/renet-cross-core", "crates/bevy-net-debug", "examples/shared", "examples/server", "examples/client"]
 resolver = "2"
 
 [features]
@@ -25,7 +25,7 @@ native-async = ["dep:reqwest", "reqwest/default-tls", "reqwest/json"]
 [dependencies]
 axum = { version = "0.8.8", optional = true }
 log = "0.4.22"
-renet = "2.0.0"
+renet = { package = "renet-cross-core", path = "crates/renet-cross-core", version = "0.1.0" }
 renetcode = "2.0.0"
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.17"

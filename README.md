@@ -19,14 +19,13 @@ This bootstrap demonstrates one authoritative game server that accepts:
 
 The game loop and authority are shared, with one `RenetServer` and one `MixedServerTransport` (`udp + webrtc`).
 
-## Use With `renet` (Recommended)
+## Use the bundled protocol core
 
-This crate intentionally does **not** re-export `renet`. Users should depend on both crates directly:
+The corrected protocol core is re-exported as `renet_cross::renet`. Depend on the transport and import its core types:
 
 ```toml
 [dependencies]
-renet = "2"
-renet-cross = "0.6"
+renet-cross = "0.7"
 ```
 
 ### Server setup helper
@@ -34,7 +33,7 @@ renet-cross = "0.6"
 ```rust
 use std::{net::SocketAddr, time::Duration};
 
-use renet::{ConnectionConfig, RenetServer, ServerEvent};
+use renet_cross::renet::{ConnectionConfig, RenetServer, ServerEvent};
 use renet_cross::{
     BootstrapConfig, BootstrapService, MixedTransportBuilder, MonotonicClientIdAllocator,
     ServerAuthentication, UnsecureDevAuthPolicy,
@@ -75,7 +74,7 @@ let bootstrap = BootstrapService::new(
 ```rust
 use std::time::Duration;
 
-use renet::RenetClient;
+use renet_cross::renet::RenetClient;
 use renet_cross::{connect_via_session_http_blocking, NativeConnectOptions};
 
 let (mut client, mut transport, _client_id): (_, _, u64) =
@@ -294,3 +293,18 @@ See the [migration and setup guide](docs/conditioner-ui.md).
 
 Licensed under either the [MIT License](LICENSE-MIT) or the
 [Apache License, Version 2.0](LICENSE-APACHE), at your option.
+
+## Migrating to 0.7
+
+The transport now ships its corrected protocol core as `renet-cross-core` 0.1,
+re-exported as `renet_cross::renet`. Replace imports from upstream `renet` with
+`renet_cross::renet` and remove the upstream dependency. Alternatively alias the
+core in Cargo: `renet = { package = "renet-cross-core", version = "0.1" }`.
+Types from upstream Renet and this core are distinct. No downstream Cargo patch
+is required. Both peers should upgrade to stop ACK feedback from an old peer.
+The wire format is unchanged.
+
+Data receipts trigger immediate ACK output; ACK-only receipts do not trigger
+another ACK. RTT/loss samples exclude ACK-only traffic. Statistics buckets expire
+correctly across skipped updates, and late ACKs cannot credit recycled buckets.
+Loss remains an estimate of outgoing unacknowledged data, not an IP drop count.

@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "bevy-net-debug"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bevy",
  "renet-cross",
@@ -2353,8 +2353,8 @@ dependencies = [
  "console_error_panic_hook",
  "getrandom 0.2.17",
  "log",
- "renet",
  "renet-cross",
+ "renet-cross-core",
  "renetcode",
  "shared",
  "wasm-bindgen-futures",
@@ -5624,19 +5624,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
-name = "renet"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8535f2f4b5afe5e31fc37be4b8a1f167e61177f356b1c6ee8456b7045d6c74c0"
-dependencies = [
- "bytes",
- "log",
- "octets",
-]
-
-[[package]]
 name = "renet-cross"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "axum",
  "getrandom 0.2.17",
@@ -5644,7 +5633,7 @@ dependencies = [
  "gloo-timers",
  "js-sys",
  "log",
- "renet",
+ "renet-cross-core",
  "renetcode",
  "reqwest",
  "serde",
@@ -5656,6 +5645,16 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "renet-cross-core"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "env_logger",
+ "log",
+ "octets",
 ]
 
 [[package]]
@@ -6082,8 +6081,8 @@ dependencies = [
  "clap",
  "env_logger",
  "log",
- "renet",
  "renet-cross",
+ "renet-cross-core",
  "shared",
  "tokio",
  "tower-http 0.7.1",

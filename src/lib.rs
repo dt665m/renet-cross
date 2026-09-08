@@ -1,3 +1,6 @@
+/// Protocol core used by this transport. Use these types instead of upstream `renet`.
+pub use renet;
+
 #[cfg(all(feature = "axum", not(target_arch = "wasm32")))]
 mod axum_bootstrap;
 mod bootstrap;

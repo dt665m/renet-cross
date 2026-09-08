@@ -1,6 +1,6 @@
 [package]
 name = "bevy-net-debug"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Built-in Bevy debug UI for renet-cross packet conditioning"
@@ -9,5 +9,5 @@ repository = "https://github.com/dt665m/renet-cross"
 readme = "README.md"
 
 [dependencies]
-renet-cross = { path = "../..", version = "0.6.0", default-features = false }
+renet-cross = { path = "../..", version = "0.7.0", default-features = false }
 bevy = { version = "0.19.1", default-features = false, features = ["std", "bevy_ui", "bevy_text", "default_font"] }
