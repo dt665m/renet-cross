@@ -397,6 +397,7 @@ impl WebRtcNetcodeServerTransport {
             };
             let seen = per_peer_datagrams.entry(client_id).or_default();
             if *seen >= MAX_WEBRTC_DATAGRAMS_PER_PEER_PER_UPDATE {
+                trace_packet(client_id, "drop_peer_quota", &self.buffer[..len]);
                 continue;
             }
             *seen += 1;
@@ -404,6 +405,7 @@ impl WebRtcNetcodeServerTransport {
                 // A bounded drain can yield before reaching Timeout. Drop this
                 // datagram rather than violating str0m's mutation contract.
                 if peer.next_timeout.is_none() {
+                    trace_packet(client_id, "drop_pending_output", &self.buffer[..len]);
                     self.flush_peer_output(client_id);
                     continue;
                 }
@@ -414,12 +416,13 @@ impl WebRtcNetcodeServerTransport {
                     self.addr_to_client_id.remove(&old_source);
                 }
                 self.addr_to_client_id.insert(source, client_id);
-                if let Err(err) = peer.rtc.handle_input(input)
-                    && !is_receive_queue_full_error(&err)
-                    && !is_malformed_webrtc_input_error(&err)
-                {
-                    log::warn!("WebRTC input failed for {client_id}: {err}");
-                    peer.rtc.disconnect();
+                if let Err(err) = peer.rtc.handle_input(input) {
+                    trace_packet(client_id, "input_error", &self.buffer[..len]);
+                    if !is_receive_queue_full_error(&err) && !is_malformed_webrtc_input_error(&err)
+                    {
+                        log::warn!("WebRTC input failed for {client_id}: {err}");
+                        peer.rtc.disconnect();
+                    }
                 }
             }
             // Never ingest a second datagram while str0m still has queued output.
@@ -506,6 +509,7 @@ impl WebRtcNetcodeServerTransport {
                 );
             }
             Event::ChannelData(data) => {
+                trace_packet(peer.client_id, "receive", &data.data);
                 if peer.data_channel != Some(data.id) || !data.binary {
                     return;
                 }
@@ -659,7 +663,9 @@ impl WebRtcNetcodeServerTransport {
     }
 
     fn send_to_peer_lossy(&mut self, client_id: ClientId, payload: &[u8]) {
+        trace_packet(client_id, "send_attempt", payload);
         if let Err(err) = self.send_to_peer(client_id, payload) {
+            trace_packet(client_id, "send_error", payload);
             log::debug!("Failed to send packet to peer {client_id}: {err}");
         }
     }
@@ -705,6 +711,7 @@ impl WebRtcNetcodeServerTransport {
             return Err(TransportError::DataChannelBackpressure { client_id });
         }
 
+        trace_packet(client_id, "send_accepted", payload);
         Ok(())
     }
 }
@@ -757,3 +764,25 @@ fn is_non_fatal_webrtc_send_error(err: &io::Error) -> bool {
 #[cfg(test)]
 #[path = "server_tests.rs"]
 mod tests;
+
+// Opt-in bounded diagnostics at the encrypted data-channel boundary. Fingerprints
+// correlate with browser captures without logging authentication/game payloads.
+fn trace_packet(client_id: ClientId, event: &str, packet: &[u8]) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static RECORDS: AtomicUsize = AtomicUsize::new(0);
+    const LIMIT: usize = 100_000;
+    if !log::log_enabled!(target: "renet_cross::packet_trace", log::Level::Trace)
+        || RECORDS
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n < LIMIT).then_some(n + 1)
+            })
+            .is_err()
+    {
+        return;
+    }
+    let hash = packet.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    });
+    log::trace!(target: "renet_cross::packet_trace",
+        "packet client={client_id} event={event} len={} hash={hash:016x}", packet.len());
+}

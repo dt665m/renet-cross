@@ -309,3 +309,35 @@ Renet can generate ACK packets while it retains receipt history, so calling
 Diagnostics expose upstream Renet's statistics unchanged: packet loss estimates
 outgoing unacknowledged packets, including ACK-only packets, and is not an IP-layer
 drop measurement.
+
+
+## Temporary SCTP correction
+
+Version 0.6.1 adds bounded transport tracing and documents an application-level
+workaround for premature SCTP abandonment. **Installing 0.6.1 alone does not
+include the unpublished SCTP fix.** While the upstream fix is pending, add this
+override to your application's workspace-root `Cargo.toml`:
+
+```toml
+[patch.crates-io.sctp-proto]
+git = "https://github.com/dt665m/sctp-proto.git"
+rev = "cb94f37991c185fb9cc2fd41fbe92965e2a1f713"
+```
+
+Then update the lockfile with `cargo update -p sctp-proto`. The exact commit
+implements the PR-SCTP retry limit at the retransmission boundary and shares
+abandonment across message fragments. It prevents premature FORWARD-TSN and
+acknowledgement amplification during ordinary traffic. See
+[upstream PR #57](https://github.com/algesten/sctp-proto/pull/57).
+
+Cargo only honors `[patch]` at the consuming workspace root. The override in
+this repository applies to its own development builds; it is not inherited by
+downstream users and is not a registry dependency in the published package.
+Remove the override once a published dependency chain requires the upstream fix.
+Renet remains unmodified registry 2.0.0.
+
+For temporary native packet correlation, enable the log target
+`renet_cross::packet_trace=trace`. It emits at most 100,000 records per process
+across all peers: client ID, event, encrypted packet length and a fingerprint.
+It records data-channel sends/receives and local quota/input/send failures,
+without logging packet contents. Leave this target disabled for normal use.
