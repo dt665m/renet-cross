@@ -4,9 +4,14 @@ Optional Bevy 0.19.1 debug panel for `renet-cross` client packet conditioning. T
 
 ```toml
 [dependencies]
-renet-cross = "0.7"
-bevy-net-debug = "0.2"
+renet-cross = { git = "https://github.com/dt665m/renet-cross.git", tag = "v0.7.0" }
+bevy-net-debug = { git = "https://github.com/dt665m/renet-cross.git", tag = "v0.7.0" }
 ```
+
+Use the matching Git pair for the 0.7 transport integration; the published 0.2
+companion still depends on the 0.6 transport. Apply the
+[required dependency corrections](../../README.md#required-dependency-corrections)
+at the application's workspace root.
 
 Use Bevy 0.19.1 in the consuming application.
 
