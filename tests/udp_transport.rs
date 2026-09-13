@@ -48,6 +48,12 @@ struct Harness {
     delayed: usize,
     duplicated: usize,
     pending: Vec<Datagram>,
+    emitted_packets: [u64; 2],
+    emitted_bytes: [u64; 2],
+    maximum_data_datagram: usize,
+    measured_data_datagrams: usize,
+    drop_first_keepalive: bool,
+    lost_keepalives: usize,
 }
 
 impl Harness {
@@ -113,6 +119,12 @@ impl Harness {
             delayed: 0,
             duplicated: 0,
             pending: Vec::new(),
+            emitted_packets: [0; 2],
+            emitted_bytes: [0; 2],
+            maximum_data_datagram: 0,
+            measured_data_datagrams: 0,
+            drop_first_keepalive: false,
+            lost_keepalives: 0,
         }
     }
 
@@ -130,7 +142,25 @@ impl Harness {
                 assert_eq!(source, self.client_addr);
                 self.server_addr
             };
+            let direction = usize::from(source == self.client_addr);
+            self.emitted_packets[direction] += 1;
+            self.emitted_bytes[direction] += len as u64;
             self.packet += 1;
+            if self.drop_first_keepalive
+                && source == self.server_addr
+                && len > 0
+                && buffer[0] & 0x0f == 4
+            {
+                self.drop_first_keepalive = false;
+                self.lost_keepalives += 1;
+                continue;
+            }
+            // Inspect the public netcode packet discriminator, never decrypted
+            // message contents; these are actual socket-emitted UDP payloads.
+            if len > 0 && buffer[0] & 0x0f == 5 {
+                self.maximum_data_datagram = self.maximum_data_datagram.max(len);
+                self.measured_data_datagrams += 1;
+            }
             if self.impaired && self.packet.is_multiple_of(7) {
                 self.dropped += 1;
                 continue;
@@ -198,6 +228,46 @@ impl Harness {
             self.step
         );
     }
+}
+
+#[test]
+fn lost_initial_keepalive_recovers_during_continuous_payloads() {
+    let mut h = Harness::new(true);
+    h.drop_first_keepalive = true;
+    let mut received = false;
+    let mut replied = false;
+    for _ in 0..200 {
+        if h.server.is_connected(ID) {
+            h.server
+                .send_message(ID, DefaultChannel::Unreliable, vec![7; 32]);
+        }
+        h.tick();
+        if h.client
+            .receive_message(DefaultChannel::Unreliable)
+            .is_some()
+        {
+            received = true;
+            h.client
+                .send_message(DefaultChannel::ReliableOrdered, vec![9; 8]);
+        }
+        if h.server
+            .receive_message(ID, DefaultChannel::ReliableOrdered)
+            .is_some()
+        {
+            replied = true;
+            break;
+        }
+    }
+    assert_eq!(h.lost_keepalives, 1);
+    assert!(
+        h.client.is_connected(),
+        "payloads must not suppress stock confirmation retries"
+    );
+    assert!(
+        received,
+        "application traffic must resume after confirmation"
+    );
+    assert!(replied, "authenticated bidirectional traffic must resume");
 }
 
 #[test]
@@ -324,4 +394,148 @@ fn idle_connection_times_out_without_wall_clock_sleep() {
         .update(Duration::from_secs(20), &mut h.server)
         .unwrap();
     assert!(!h.server.is_connected(ID));
+}
+
+#[test]
+fn default_secure_udp_packets_and_retransmissions_fit_netcode_payload() {
+    let mut h = Harness::new(true);
+    h.connect();
+    h.impaired = true;
+    let messages = (0..25_u8)
+        .flat_map(|id| {
+            [40, 64, 594, 1100, 1105, 1106, 16384]
+                .into_iter()
+                .map(move |length| vec![id; length])
+        })
+        .collect::<Vec<_>>();
+    for message in &messages {
+        h.client
+            .send_message(DefaultChannel::ReliableOrdered, message.clone());
+        h.server
+            .send_message(ID, DefaultChannel::ReliableOrdered, message.clone());
+    }
+    let mut at_client = Vec::new();
+    let mut at_server = Vec::new();
+    for _ in 0..2000 {
+        h.tick();
+        while let Some(message) = h.client.receive_message(DefaultChannel::ReliableOrdered) {
+            at_client.push(message.to_vec());
+        }
+        while let Some(message) = h
+            .server
+            .receive_message(ID, DefaultChannel::ReliableOrdered)
+        {
+            at_server.push(message.to_vec());
+        }
+        assert!(
+            h.maximum_data_datagram <= 1300 + 25,
+            "encrypted UDP payload {}",
+            h.maximum_data_datagram
+        );
+        assert!(h.maximum_data_datagram + 48 <= 1373);
+        if at_client.len() == messages.len() && at_server.len() == messages.len() {
+            break;
+        }
+    }
+    assert_eq!(at_client, messages);
+    assert_eq!(at_server, messages);
+    assert!(h.measured_data_datagrams > 512);
+    assert!(
+        h.maximum_data_datagram + 48 > 1200,
+        "stock slice payloads deliberately exceed the former IP cap"
+    );
+    assert!(h.dropped > 0 && h.delayed > 0 && h.duplicated > 0);
+}
+
+#[test]
+fn paced_secure_udp_counts_actual_wire_control_and_retries_and_delivers_reliable() {
+    use renet_cross::{EgressBasis, EgressConfig};
+    let mut h = Harness::new(true);
+    let config = EgressConfig::new(EgressBasis::NativeUdpIp, 60_000, 6000, 512).unwrap();
+    h.client_transport.set_egress_limit(Some(config)).unwrap();
+    h.server_transport.set_egress_limit(Some(config)).unwrap();
+    let start = std::time::Instant::now();
+    h.connect();
+    h.impaired = true;
+    let count = 64;
+    for n in 0..count {
+        let mut message = vec![n as u8; 900];
+        message[0] = n as u8;
+        h.client
+            .send_message(DefaultChannel::ReliableOrdered, message.clone());
+        h.server
+            .send_message(ID, DefaultChannel::ReliableOrdered, message);
+    }
+    let mut received = [0; 2];
+    while received != [count; 2] && start.elapsed() < Duration::from_secs(10) {
+        h.tick();
+        while let Some(message) = h
+            .server
+            .receive_message(ID, DefaultChannel::ReliableOrdered)
+        {
+            assert_eq!(message, vec![received[0] as u8; 900]);
+            received[0] += 1;
+        }
+        while let Some(message) = h.client.receive_message(DefaultChannel::ReliableOrdered) {
+            assert_eq!(message, vec![received[1] as u8; 900]);
+            received[1] += 1;
+        }
+        let stats = [
+            h.server_transport.egress_stats(),
+            h.client_transport.egress_stats(),
+        ];
+        for (side, stats) in stats.iter().enumerate() {
+            // The loopback socket may deliver an accepted send after this pump.
+            assert!(stats.sent_packets >= h.emitted_packets[side]);
+            assert!(stats.encrypted_logical_bytes >= h.emitted_bytes[side]);
+            assert_eq!(
+                stats.native_udp_ip_bytes,
+                stats.encrypted_logical_bytes + 28 * stats.sent_packets
+            );
+            assert!(
+                stats.native_udp_ip_bytes
+                    <= config.burst_bytes()
+                        + (start.elapsed().as_secs_f64() * config.bytes_per_second() as f64) as u64
+            );
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(received, [count; 2]);
+    assert!(h.client_transport.egress_stats().pacing_drops > 0);
+    assert!(h.server_transport.egress_stats().pacing_drops > 0);
+    assert!(h.client_transport.egress_stats().control_packets > 0);
+    assert!(
+        h.server_transport
+            .peer_egress_stats(ID)
+            .unwrap()
+            .control_packets
+            > 0
+    );
+    assert_eq!(h.server_transport.egress_stats().deferred_packets, 0);
+    assert!(h.dropped > 0 && h.delayed > 0 && h.duplicated > 0);
+    h.impaired = false;
+    h.server_transport.disconnect_all(&mut h.server);
+    for _ in 0..100 {
+        h.pump();
+        if h.server_transport.egress_stats().sent_packets == h.emitted_packets[0]
+            && h.client_transport.egress_stats().sent_packets == h.emitted_packets[1]
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    for (side, stats) in [
+        h.server_transport.egress_stats(),
+        h.client_transport.egress_stats(),
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert_eq!(stats.sent_packets, h.emitted_packets[side]);
+        assert_eq!(stats.encrypted_logical_bytes, h.emitted_bytes[side]);
+        assert_eq!(
+            stats.native_udp_ip_bytes,
+            h.emitted_bytes[side] + 28 * h.emitted_packets[side]
+        );
+    }
 }

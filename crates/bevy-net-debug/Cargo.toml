@@ -9,5 +9,5 @@ repository = "https://github.com/dt665m/renet-cross"
 readme = "README.md"
 
 [dependencies]
-renet-cross = { path = "../..", version = "0.6.0", default-features = false }
+renet-cross = { path = "../..", version = "0.7.0", default-features = false }
 bevy = { version = "0.19.1", default-features = false, features = ["std", "bevy_ui", "bevy_text", "default_font"] }

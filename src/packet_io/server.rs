@@ -33,6 +33,13 @@ impl ServerPacketGate {
             handle.defer_at(*owner, direction.into(), peer, bytes, handle.elapsed())
         })
     }
+    /// Packets already queued below Renet still reserve transport credit.
+    pub fn queued_outgoing(&self, peer: ServerPeerId) -> crate::conditioner::DirectionStats {
+        self.attached
+            .as_ref()
+            .map(|(handle, owner)| handle.queued_outgoing(*owner, peer))
+            .unwrap_or_default()
+    }
     pub fn drain(&mut self, direction: Direction) -> Vec<(ServerPeerId, Vec<u8>)> {
         self.attached
             .as_ref()

@@ -6,16 +6,20 @@ use std::{
 };
 
 use crate::packet_io::{Direction, PacketGate};
-#[cfg(any(feature = "native-sync", feature = "native-async"))]
 use renet::ConnectionConfig;
 use renet::RenetClient;
 use renetcode::{ClientAuthentication, NETCODE_MAX_PACKET_BYTES, NetcodeClient, NetcodeError};
 
-#[cfg(any(feature = "native-sync", feature = "native-async"))]
 use crate::{SessionCreateResponse, bootstrap::unix_now_duration};
 
 #[derive(Debug, thiserror::Error)]
 pub enum NativeClientError {
+    #[error(transparent)]
+    BootstrapAuth(#[from] crate::BootstrapAuthError),
+    #[error(transparent)]
+    Security(#[from] crate::SessionSecurityError),
+    #[error("bootstrap HTTP body exceeds its size limit")]
+    BodyTooLarge,
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -41,23 +45,30 @@ pub enum NativeClientError {
 
 #[derive(Debug, Clone)]
 pub struct NativeConnectOptions {
+    pub connection_config: ConnectionConfig,
     pub udp_bind: SocketAddr,
     pub override_udp_addr: Option<SocketAddr>,
     pub transport: crate::ClientTransportConfig,
+    pub session_request: crate::SessionCreateRequest,
+    pub require_secure: bool,
 }
 
 impl Default for NativeConnectOptions {
     fn default() -> Self {
         Self {
+            connection_config: ConnectionConfig::default(),
             udp_bind: SocketAddr::from(([0, 0, 0, 0], 0)),
             override_udp_addr: None,
             transport: Default::default(),
+            session_request: Default::default(),
+            require_secure: false,
         }
     }
 }
 
 #[derive(Debug)]
 pub struct UdpNetcodeClientTransport {
+    egress: crate::egress::Egress<SocketAddr>,
     socket: UdpSocket,
     netcode_client: NetcodeClient,
     // Receive complete datagrams before enforcing the protocol size. A smaller
@@ -91,6 +102,7 @@ impl UdpNetcodeClientTransport {
             packets.attach(handle);
         }
         Ok(Self {
+            egress: crate::egress::Egress::new(crate::EgressBasis::NativeUdpIp),
             socket,
             netcode_client,
             buffer: [0; 65_535],
@@ -99,15 +111,26 @@ impl UdpNetcodeClientTransport {
         })
     }
 
+    /// Configure before the first update to include handshake traffic.
+    pub fn set_egress_limit(
+        &mut self,
+        config: Option<crate::EgressConfig>,
+    ) -> Result<(), crate::EgressConfigError> {
+        self.egress.configure(config)
+    }
+    pub fn egress_stats(&self) -> crate::EgressStats {
+        self.egress.stats()
+    }
+
     /// Bound receive work per call, including packets from unrelated sources.
     pub fn set_max_datagrams_per_update(&mut self, limit: NonZeroUsize) {
         self.max_datagrams_per_update = limit;
     }
 
-    fn flush_outgoing(&self) -> io::Result<()> {
+    fn flush_outgoing(&mut self) -> io::Result<()> {
         for (addr, bytes) in self.packets.drain(Direction::Outgoing) {
             if addr == self.netcode_client.server_addr() {
-                send_datagram(&self.socket, &bytes, addr)?;
+                send_datagram(&mut self.egress, &self.socket, &bytes, addr)?;
             }
         }
         Ok(())
@@ -140,7 +163,7 @@ impl UdpNetcodeClientTransport {
             && !self.netcode_client.is_disconnected()
             && let Ok((addr, packet)) = self.netcode_client.disconnect()
         {
-            let _ = send_packet(&self.packets, &self.socket, packet, addr);
+            let _ = send_packet(&mut self.egress, &self.packets, &self.socket, packet, addr);
         }
 
         if self.netcode_client.is_connected() {
@@ -170,7 +193,7 @@ impl UdpNetcodeClientTransport {
         self.deliver_incoming(client);
 
         if let Some((packet, addr)) = self.netcode_client.update(duration) {
-            send_packet(&self.packets, &self.socket, packet, addr)?;
+            send_packet(&mut self.egress, &self.packets, &self.socket, packet, addr)?;
         }
 
         // Reflect handshakes and timeouts in this call rather than one frame later.
@@ -201,7 +224,7 @@ impl UdpNetcodeClientTransport {
         let packets = client.get_packets_to_send();
         for packet in packets {
             let (addr, payload) = self.netcode_client.generate_payload_packet(&packet)?;
-            send_packet(&self.packets, &self.socket, payload, addr)?;
+            send_packet(&mut self.egress, &self.packets, &self.socket, payload, addr)?;
         }
 
         Ok(())
@@ -223,24 +246,41 @@ impl UdpNetcodeClientTransport {
 }
 
 fn send_packet(
+    egress: &mut crate::egress::Egress<SocketAddr>,
     gate: &PacketGate<SocketAddr>,
     socket: &UdpSocket,
     bytes: &[u8],
     addr: SocketAddr,
 ) -> io::Result<()> {
     if !gate.defer(Direction::Outgoing, addr, bytes) {
-        send_datagram(socket, bytes, addr)?;
+        send_datagram(egress, socket, bytes, addr)?;
     }
     for (destination, packet) in gate.drain(Direction::Outgoing) {
         if destination == addr {
-            send_datagram(socket, &packet, destination)?;
+            send_datagram(egress, socket, &packet, destination)?;
         }
     }
     Ok(())
 }
 
-fn send_datagram(socket: &UdpSocket, payload: &[u8], addr: SocketAddr) -> io::Result<()> {
-    match socket.send_to(payload, addr) {
+fn send_datagram(
+    egress: &mut crate::egress::Egress<SocketAddr>,
+    socket: &UdpSocket,
+    payload: &[u8],
+    addr: SocketAddr,
+) -> io::Result<()> {
+    let overhead = crate::egress::ip_overhead(addr);
+    if !egress.admit(addr, payload, overhead) {
+        return Ok(());
+    }
+    let result = socket.send_to(payload, addr);
+    egress.complete(
+        addr,
+        payload,
+        overhead,
+        result.as_ref().is_ok_and(|len| *len == payload.len()),
+    );
+    match result {
         Ok(_) => Ok(()),
         // This is a lossy transport: Renet retransmits reliable messages. Do not
         // grow a second queue of stale packets behind a saturated socket.
@@ -263,8 +303,18 @@ pub fn connect_via_session_http_blocking(
     options: NativeConnectOptions,
 ) -> Result<(RenetClient, UdpNetcodeClientTransport, u64), NativeClientError> {
     let url = format!("{}/api/session/new", base_http.trim_end_matches('/'));
-    let response = reqwest::blocking::Client::new()
+    let body = session_request_body(&options, protocol_id)?;
+    let response = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|_| NativeClientError::HttpRequest {
+            url: url.clone(),
+            detail: "failed to construct HTTP client".into(),
+        })?
         .post(&url)
+        .header("content-type", "application/json")
+        .body(body)
         .send()
         .map_err(|err| NativeClientError::HttpRequest {
             url: url.clone(),
@@ -282,8 +332,18 @@ pub async fn connect_via_session_http_async(
     options: NativeConnectOptions,
 ) -> Result<(RenetClient, UdpNetcodeClientTransport, u64), NativeClientError> {
     let url = format!("{}/api/session/new", base_http.trim_end_matches('/'));
-    let response = reqwest::Client::new()
+    let body = session_request_body(&options, protocol_id)?;
+    let response = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|_| NativeClientError::HttpRequest {
+            url: url.clone(),
+            detail: "failed to construct HTTP client".into(),
+        })?
         .post(&url)
+        .header("content-type", "application/json")
+        .body(body)
         .send()
         .await
         .map_err(|err| NativeClientError::HttpRequest {
@@ -295,12 +355,14 @@ pub async fn connect_via_session_http_async(
     connect_from_session(session, protocol_id, options)
 }
 
-#[cfg(any(feature = "native-sync", feature = "native-async"))]
-fn connect_from_session(
+/// Connect using an app-owned bootstrap endpoint's response, without HTTP features.
+/// A present secure envelope is always validated; require_secure forbids fallback.
+pub fn connect_from_session(
     session: SessionCreateResponse,
     protocol_id: u64,
     options: NativeConnectOptions,
 ) -> Result<(RenetClient, UdpNetcodeClientTransport, u64), NativeClientError> {
+    let request = &options.session_request;
     let server_addr = if let Some(override_addr) = options.override_udp_addr {
         override_addr
     } else {
@@ -308,75 +370,152 @@ fn connect_from_session(
             .udp_addr
             .parse()
             .map_err(|source| NativeClientError::InvalidSessionUdpAddr {
-                addr: session.udp_addr.clone(),
+                addr: "<invalid endpoint>".into(),
                 source,
             })?
     };
 
     let now = unix_now_duration()?;
-    let authentication = ClientAuthentication::Unsecure {
+    let authentication = session.authentication(
         protocol_id,
-        client_id: session.client_id,
         server_addr,
-        user_data: None,
-    };
+        crate::SessionTransport::Udp,
+        now,
+        options.require_secure,
+        request,
+    )?;
 
     let socket = UdpSocket::bind(options.udp_bind)?;
     let transport =
         UdpNetcodeClientTransport::new_with_config(now, authentication, socket, options.transport)?;
-    let client = RenetClient::new(ConnectionConfig::default());
+    let client = RenetClient::new(options.connection_config);
 
     Ok((client, transport, session.client_id))
 }
 
+#[cfg(any(feature = "native-sync", feature = "native-async"))]
+fn session_request_body(
+    options: &NativeConnectOptions,
+    protocol_id: u64,
+) -> Result<Vec<u8>, NativeClientError> {
+    let mut request = options.session_request.clone();
+    request.require_secure |= options.require_secure;
+    if request.requests_authentication() {
+        if request.protocol_id.is_some_and(|p| p != protocol_id) {
+            return Err(crate::SessionSecurityError::BindingMismatch.into());
+        }
+        request.protocol_id = Some(protocol_id);
+    }
+    request.validate()?;
+    let bytes = serde_json::to_vec(&request).map_err(|_| NativeClientError::BodyTooLarge)?;
+    if bytes.len() > crate::MAX_SESSION_REQUEST_BYTES {
+        return Err(NativeClientError::BodyTooLarge);
+    }
+    Ok(bytes)
+}
 #[cfg(feature = "native-sync")]
 fn decode_json_response_blocking<T: serde::de::DeserializeOwned>(
     response: reqwest::blocking::Response,
     url: &str,
 ) -> Result<T, NativeClientError> {
+    use std::io::Read;
     if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let body = response
-            .text()
-            .unwrap_or_else(|_| "<failed to read response body>".to_string());
         return Err(NativeClientError::HttpStatus {
-            url: url.to_string(),
-            status,
-            body,
+            url: url.into(),
+            status: response.status().as_u16(),
+            body: "bootstrap request rejected".into(),
         });
     }
-
+    if response
+        .content_length()
+        .is_some_and(|n| n > crate::MAX_SESSION_RESPONSE_BYTES as u64)
+    {
+        return Err(NativeClientError::BodyTooLarge);
+    }
+    let mut bytes = Vec::new();
     response
-        .json::<T>()
-        .map_err(|err| NativeClientError::HttpDecode {
-            url: url.to_string(),
-            detail: err.to_string(),
-        })
+        .take(crate::MAX_SESSION_RESPONSE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > crate::MAX_SESSION_RESPONSE_BYTES {
+        return Err(NativeClientError::BodyTooLarge);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| NativeClientError::HttpDecode {
+        url: url.into(),
+        detail: "invalid bootstrap JSON".into(),
+    })
 }
-
 #[cfg(feature = "native-async")]
 async fn decode_json_response_async<T: serde::de::DeserializeOwned>(
-    response: reqwest::Response,
+    mut response: reqwest::Response,
     url: &str,
 ) -> Result<T, NativeClientError> {
     if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<failed to read response body>".to_string());
         return Err(NativeClientError::HttpStatus {
-            url: url.to_string(),
-            status,
-            body,
+            url: url.into(),
+            status: response.status().as_u16(),
+            body: "bootstrap request rejected".into(),
         });
     }
-
-    response
-        .json::<T>()
+    if response
+        .content_length()
+        .is_some_and(|n| n > crate::MAX_SESSION_RESPONSE_BYTES as u64)
+    {
+        return Err(NativeClientError::BodyTooLarge);
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|err| NativeClientError::HttpDecode {
-            url: url.to_string(),
-            detail: err.to_string(),
-        })
+        .map_err(|_| NativeClientError::HttpDecode {
+            url: url.into(),
+            detail: "failed to read bootstrap response".into(),
+        })?
+    {
+        if chunk.len() > crate::MAX_SESSION_RESPONSE_BYTES - bytes.len() {
+            return Err(NativeClientError::BodyTooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| NativeClientError::HttpDecode {
+        url: url.into(),
+        detail: "invalid bootstrap JSON".into(),
+    })
+}
+
+#[cfg(test)]
+mod egress_tests {
+    use super::*;
+    #[test]
+    fn actual_ipv4_and_ipv6_datagrams_count_destination_headers_and_cap_drops() {
+        for bind in ["127.0.0.1:0", "[::1]:0"] {
+            let sender = UdpSocket::bind(bind).unwrap();
+            let receiver = UdpSocket::bind(bind).unwrap();
+            receiver
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let addr = receiver.local_addr().unwrap();
+            let mut egress = crate::egress::Egress::new(crate::EgressBasis::NativeUdpIp);
+            egress
+                .configure(Some(
+                    crate::EgressConfig::new(crate::EgressBasis::NativeUdpIp, 1, 2048, 256)
+                        .unwrap(),
+                ))
+                .unwrap();
+            send_datagram(&mut egress, &sender, &[5; 1000], addr).unwrap();
+            let mut buffer = [0; 3000];
+            assert_eq!(receiver.recv_from(&mut buffer).unwrap().0, 1000);
+            send_datagram(&mut egress, &sender, &[5; 2000], addr).unwrap();
+            send_datagram(&mut egress, &sender, &[6; 20], addr).unwrap();
+            assert_eq!(receiver.recv_from(&mut buffer).unwrap().0, 20);
+            let stats = egress.stats();
+            assert_eq!(stats.sent_packets, 2);
+            assert_eq!(stats.control_packets, 1);
+            assert_eq!(stats.cap_drops, 1);
+            assert_eq!(stats.encrypted_logical_bytes, 1020);
+            assert_eq!(
+                stats.native_udp_ip_bytes,
+                1020 + if addr.is_ipv4() { 56 } else { 96 }
+            );
+        }
+    }
 }

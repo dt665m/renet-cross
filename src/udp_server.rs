@@ -16,6 +16,7 @@ use crate::{
 
 #[derive(Debug)]
 pub struct UdpNetcodeServerTransport {
+    egress: crate::egress::Egress<SocketAddr>,
     socket: UdpSocket,
     netcode_server: NetcodeServer,
     // Enforce packet size after receiving the entire datagram; don't interpret a
@@ -44,11 +45,37 @@ impl UdpNetcodeServerTransport {
             packets.attach(handle);
         }
         Ok(Self {
+            egress: crate::egress::Egress::new(crate::EgressBasis::NativeUdpIp),
             socket,
             netcode_server,
             buffer: [0; 65_535],
             max_datagrams_per_update: NonZeroUsize::new(256).unwrap(),
             packets,
+        })
+    }
+
+    /// Per-destination ceiling, including netcode handshake/disconnect traffic.
+    pub fn set_egress_limit(
+        &mut self,
+        config: Option<crate::EgressConfig>,
+    ) -> Result<(), crate::EgressConfigError> {
+        self.egress.configure(config)
+    }
+    pub fn egress_stats(&self) -> crate::EgressStats {
+        self.egress.stats()
+    }
+    pub fn peer_egress_stats(&self, client_id: ClientId) -> Option<crate::EgressStats> {
+        self.client_addr(client_id)
+            .and_then(|addr| self.egress.peer_stats(addr))
+    }
+
+    pub fn peer_egress_allowance(&self, client_id: ClientId) -> Option<crate::EgressAllowance> {
+        self.client_addr(client_id).map(|addr| {
+            let mut allowance = self.egress.peer_allowance(addr);
+            allowance.ip_udp_overhead = crate::egress::ip_overhead(addr);
+            let queued = self.packets.queued_outgoing(ServerPeerId::Udp(addr));
+            allowance.reserve_queued(queued.queued_bytes, queued.queued_packets);
+            allowance
         })
     }
 
@@ -162,9 +189,13 @@ impl UdpNetcodeServerTransport {
                     .generate_payload_packet(client_id, &packet)
                 {
                     Ok((addr, payload)) => {
-                        if let Err(err) =
-                            send_packet(&mut self.packets, &self.socket, payload, addr)
-                        {
+                        if let Err(err) = send_packet(
+                            &mut self.egress,
+                            &mut self.packets,
+                            &self.socket,
+                            payload,
+                            addr,
+                        ) {
                             log::debug!(
                                 "Failed to send packet to client {client_id} ({addr}): {err}"
                             );
@@ -184,7 +215,7 @@ impl UdpNetcodeServerTransport {
     fn flush_outgoing(&mut self) {
         for (peer, packet) in self.packets.drain(Direction::Outgoing) {
             if let ServerPeerId::Udp(addr) = peer
-                && let Err(err) = self.socket.send_to(&packet, addr)
+                && let Err(err) = send_datagram(&mut self.egress, &self.socket, &packet, addr)
             {
                 log::debug!("Failed to send queued packet to {addr}: {err}");
             }
@@ -195,7 +226,13 @@ impl UdpNetcodeServerTransport {
         match result {
             OwnedServerResult::None => {}
             OwnedServerResult::PacketToSend { addr, payload } => {
-                if let Err(err) = send_packet(&mut self.packets, &self.socket, &payload, addr) {
+                if let Err(err) = send_packet(
+                    &mut self.egress,
+                    &mut self.packets,
+                    &self.socket,
+                    &payload,
+                    addr,
+                ) {
                     log::debug!("Failed to send packet to {addr}: {err}");
                 }
             }
@@ -211,7 +248,7 @@ impl UdpNetcodeServerTransport {
             } => {
                 if server.is_connected(client_id) {
                     log::error!(
-                        "Duplicate client_id {client_id} across transports. Rejecting new UDP connection."
+                        "Duplicate identity for client {client_id}. Rejecting new UDP connection."
                     );
                     let disconnect = self.netcode_server.disconnect(client_id);
                     if let OwnedServerResult::ClientDisconnected {
@@ -220,14 +257,25 @@ impl UdpNetcodeServerTransport {
                         ..
                     } = to_owned_server_result(disconnect)
                     {
-                        let _ = self.socket.send_to(&disconnect_payload, addr);
+                        let _ = send_datagram(
+                            &mut self.egress,
+                            &self.socket,
+                            &disconnect_payload,
+                            addr,
+                        );
                     }
                     self.packets.remove(ServerPeerId::Udp(addr));
                     return;
                 }
 
                 server.add_connection(client_id);
-                if let Err(err) = send_packet(&mut self.packets, &self.socket, &payload, addr) {
+                if let Err(err) = send_packet(
+                    &mut self.egress,
+                    &mut self.packets,
+                    &self.socket,
+                    &payload,
+                    addr,
+                ) {
                     log::debug!("Failed to send connect payload to {addr}: {err}");
                 }
             }
@@ -241,7 +289,7 @@ impl UdpNetcodeServerTransport {
                 self.packets.remove(ServerPeerId::Udp(addr));
                 server.remove_connection(client_id);
                 if let Some(payload) = payload {
-                    let _ = self.socket.send_to(&payload, addr);
+                    let _ = send_datagram(&mut self.egress, &self.socket, &payload, addr);
                 }
             }
         }
@@ -262,6 +310,7 @@ impl UdpNetcodeServerTransport {
 }
 
 fn send_packet(
+    egress: &mut crate::egress::Egress<SocketAddr>,
     gate: &mut ServerPacketGate,
     socket: &UdpSocket,
     bytes: &[u8],
@@ -270,6 +319,26 @@ fn send_packet(
     if gate.defer(Direction::Outgoing, ServerPeerId::Udp(addr), bytes) {
         Ok(bytes.len())
     } else {
-        socket.send_to(bytes, addr)
+        send_datagram(egress, socket, bytes, addr)
     }
+}
+
+fn send_datagram(
+    egress: &mut crate::egress::Egress<SocketAddr>,
+    socket: &UdpSocket,
+    payload: &[u8],
+    addr: SocketAddr,
+) -> io::Result<usize> {
+    let overhead = crate::egress::ip_overhead(addr);
+    if !egress.admit(addr, payload, overhead) {
+        return Ok(payload.len());
+    }
+    let result = socket.send_to(payload, addr);
+    egress.complete(
+        addr,
+        payload,
+        overhead,
+        result.as_ref().is_ok_and(|len| *len == payload.len()),
+    );
+    result
 }

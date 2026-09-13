@@ -2,7 +2,8 @@ use std::sync::{Arc, Mutex};
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    body::Bytes,
+    extract::{DefaultBodyLimit, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -12,7 +13,7 @@ use serde::Serialize;
 use crate::{
     BootstrapAuthError, BootstrapError, BootstrapService, MixedServerTransport,
     MonotonicClientIdAllocator, SdpHttpHookConfig, SdpHttpOfferRequest, SessionAuthPolicy,
-    SessionCreateResponse, SessionIdAllocator, UnsecureDevAuthPolicy,
+    SessionCreateRequest, SessionCreateResponse, SessionIdAllocator, UnsecureDevAuthPolicy,
 };
 
 pub struct BootstrapAxumState<A = MonotonicClientIdAllocator, P = UnsecureDevAuthPolicy>
@@ -69,15 +70,37 @@ impl IntoResponse for ApiError {
                 let status = match err {
                     BootstrapAuthError::MissingToken { .. }
                     | BootstrapAuthError::InvalidToken { .. } => StatusCode::UNAUTHORIZED,
-                    BootstrapAuthError::Message { .. } => StatusCode::FORBIDDEN,
+                    BootstrapAuthError::InvalidRequest => StatusCode::BAD_REQUEST,
+                    _ => StatusCode::FORBIDDEN,
                 };
 
                 let body = ErrorBody {
-                    error: err.to_string(),
+                    error: "bootstrap authentication rejected".into(),
                 };
                 (status, Json(body)).into_response()
             }
             ApiError::Bootstrap(BootstrapError::Hook(err)) => err.into_response(),
+            ApiError::Bootstrap(BootstrapError::BodyTooLarge) => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(ErrorBody {
+                    error: "bootstrap body too large".into(),
+                }),
+            )
+                .into_response(),
+            ApiError::Bootstrap(BootstrapError::Capacity) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorBody {
+                    error: "bootstrap capacity reached".into(),
+                }),
+            )
+                .into_response(),
+            ApiError::Bootstrap(BootstrapError::DuplicateSession) => (
+                StatusCode::CONFLICT,
+                Json(ErrorBody {
+                    error: "session unavailable".into(),
+                }),
+            )
+                .into_response(),
             ApiError::Bootstrap(BootstrapError::SessionRegistryPoisoned)
             | ApiError::Bootstrap(BootstrapError::Clock(_))
             | ApiError::TransportLockPoisoned => {
@@ -97,8 +120,15 @@ where
 {
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/api/session/new", post(session_new::<A, P>))
-        .route("/api/webrtc/offer/{client_id}", post(webrtc_offer::<A, P>))
+        .route(
+            "/api/session/new",
+            post(session_new::<A, P>)
+                .layer(DefaultBodyLimit::max(crate::MAX_SESSION_REQUEST_BYTES)),
+        )
+        .route(
+            "/api/webrtc/offer/{client_id}",
+            post(webrtc_offer::<A, P>).layer(DefaultBodyLimit::max(crate::MAX_SDP_BODY_BYTES)),
+        )
         .with_state(state)
 }
 
@@ -108,12 +138,19 @@ async fn healthz() -> &'static str {
 
 async fn session_new<A, P>(
     State(state): State<BootstrapAxumState<A, P>>,
+    body: Bytes,
 ) -> Result<Json<SessionCreateResponse>, ApiError>
 where
     A: SessionIdAllocator + Send + Sync + 'static,
     P: SessionAuthPolicy + Send + Sync + 'static,
 {
-    let session = state.bootstrap.create_session()?;
+    let request = if body.is_empty() {
+        SessionCreateRequest::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|_| BootstrapError::Auth(BootstrapAuthError::InvalidRequest))?
+    };
+    let session = state.bootstrap.create_session_with_request(&request)?;
     Ok(Json(session))
 }
 
@@ -286,5 +323,40 @@ mod tests {
             .expect("offer response");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    #[tokio::test]
+    async fn session_request_bounds_and_explicit_security_cannot_be_bypassed() {
+        let app = test_app();
+        let oversized = Request::builder()
+            .method("POST")
+            .uri("/api/session/new")
+            .header("content-type", "application/json")
+            .body(Body::from("x".repeat(crate::MAX_SESSION_REQUEST_BYTES + 1)))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(oversized).await.unwrap().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let oversized_field = serde_json::json!({ "credential": "x".repeat(crate::MAX_SESSION_CREDENTIAL_BYTES + 1) });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/session/new")
+            .header("content-type", "application/json")
+            .body(Body::from(oversized_field.to_string()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/session/new")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"require_secure":true}"#))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
     }
 }

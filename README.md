@@ -26,10 +26,36 @@ This crate intentionally does **not** re-export `renet`. Users should depend on 
 ```toml
 [dependencies]
 renet = "2"
-renet-cross = "0.6"
+renet-cross = "0.7"
 ```
 
-### Server setup helper
+### Required dependency corrections
+
+This crate uses stock crates.io Renet 2.0.0. Its required correction from the
+[Renet repository](https://github.com/dt665m/renet/tree/fix/confirmation-keepalive-starvation)
+is in `renetcode`: application payload sends must not postpone KeepAlive retries
+before the connection is confirmed. This preserves recovery when the first
+handshake KeepAlive is lost, without delaying application flushes in the transport.
+
+The crates.io package depends on registry `renetcode`; it cannot carry a Git
+dependency or apply a dependency-level patch to its consumers. Applications using
+0.7 must add both overrides at their own workspace root. This checkout repeats
+them for its own tests:
+
+```toml
+[patch.crates-io]
+renetcode = { git = "https://github.com/dt665m/renet.git", branch = "fix/confirmation-keepalive-starvation" }
+sctp-proto = { git = "https://github.com/dt665m/sctp-proto.git", rev = "cb94f37991c185fb9cc2fd41fbe92965e2a1f713" }
+```
+
+Commit `Cargo.lock` and build with `--locked` to retain the resolved fix commit.
+The branch contains the handshake correction and its regression test, with no
+Renet configuration extensions. Prefer stock upstream releases; remove this
+override when a released renetcode version includes the correction. Keep any
+future upstream changes limited to demonstrated correctness fixes or features
+appropriate for upstream review.
+
+### Explicit development server helper
 
 ```rust
 use std::{net::SocketAddr, time::Duration};
@@ -134,14 +160,14 @@ flowchart LR
 ## HTTP and Signaling Flow
 
 1. `POST /api/session/new`
-- returns `SessionCreateResponse { client_id, udp_addr, webrtc_addr, webrtc_offer_url, session_token? }`
+- accepts an optional bounded `SessionCreateRequest` JSON body and returns endpoint addresses, an SDP session token, and an optional secure token envelope. Empty bodies remain the explicit legacy development path.
 
 2. Browser only: `POST /api/webrtc/offer/{client_id}`
 - request: `{ "sdp": "...offer..." }`
 - response: `{ "client_id": <u64>, "sdp": "...answer..." }`
 
 3. Native client
-- uses `udp_addr` with unsecure netcode auth for local/dev bootstrap
+- selects the UDP connect token from a secure response; `require_secure` rejects a missing envelope. Legacy development responses use unsecure netcode only when explicitly permitted.
 
 ## Tick Order (Authoritative)
 
@@ -208,22 +234,86 @@ Current API behavior:
 
 Unknown/expired session ids return `404` in the server example.
 
-## Future Hardening (Production Path)
+## Secure bootstrap and admission
 
-The supplied HTTP connection helpers use `ClientAuthentication::Unsecure`.
-`SessionAuthPolicy` authenticates signaling; its session token is not a secure
-netcode connect token. Native low-level construction accepts
-`ClientAuthentication::Secure`. A complete authenticated browser bootstrap is
-still application/integration work. TURN credentials also do not authenticate a
-game account.
+`SecureSessionAuthPolicy<V>` uses renetcode's `ConnectToken` encryption and key
+primitives. The host supplies a `SessionAdmission` verifier; the library does not
+pretend to validate accounts. Implement `admit(&SessionCreateRequest, Duration)`
+to verify the credential and its fixed expiry, check the requested protocol,
+service and match, and return a `SessionGrant`. Its `replay_key` must identify the
+same one-use admission ticket on every retry, rather than generating a new key
+for a replayed credential. An explicitly chosen guest verifier may admit empty
+credentials and create a fresh grant, but that authenticates no account.
 
-Move from in-memory monotonic IDs to signed, time-bounded issuance:
-1. mint signed session/bootstrap tokens from trusted auth service
-2. bind token to `client_id`, audience, expiry, and optional device/account context
-3. verify token server-side before creating transport peer
-4. replace unsecure connect auth with secure token issuance and key rotation
+The grant includes `protocol_id`, `service`, `match_id`, `expires_at`, a 32-byte
+`replay_key`, and up to 128 bytes of opaque `application` data. Service, match,
+protocol, expiry and application bytes are embedded in authenticated netcode
+`user_data`. Use the same private key for `SecureSessionAuthPolicy::new(verifier,
+key)` and the mixed transport's `ServerAuthentication::Secure { private_key:
+key }`. The verifier must issue expiry no later than `BootstrapConfig.session_ttl`.
+Never include the private key in a client build or bootstrap response.
 
-This keeps transport-agnostic identity while making bootstrap secure and replay-resistant.
+`BootstrapService::create_session_with_request(&request)` returns separate UDP
+and WebRTC connect tokens because their selected endpoints differ. Its random
+SDP `session_token` is tied to that same admitted session. An offer claim is
+single-use, including a malformed offer after successful authorization; recovery
+requests a new admission ticket. A session activates once, before its grant
+expires. On a netcode connection event, the host **must** call
+`on_client_connected_with_user_data(client_id, &transport_user_data)` and reject
+an error before adding that client to gameplay. The existing
+`on_client_connected(client_id)` cannot activate a secure session. Use
+`session_grant(client_id)` for the application grant and
+`on_client_disconnected(client_id)` for cleanup. Replay fences remain until the
+grant expires, including after disconnect. Transport handshake completion alone
+is not game admission.
+
+Both `NativeConnectOptions` and `WebRtcConnectOptions` expose `session_request`
+and `require_secure`. Set the latter to `true` for secure clients:
+
+```rust
+use renet_cross::{NativeConnectOptions, SessionCreateRequest};
+let options = NativeConnectOptions {
+    require_secure: true,
+    session_request: SessionCreateRequest {
+        protocol_id: Some(77),
+        service: "my-service".into(),
+        match_id: "my-match".into(),
+        credential: "ticket-from-your-auth-service".into(),
+        require_secure: true,
+    },
+    ..Default::default()
+};
+```
+
+The blocking, async and browser HTTP helpers forward this bounded JSON request
+and reject HTTP redirects so credentials are not forwarded to another endpoint.
+`connect_from_session` is also public on native targets without HTTP features,
+and `connect_webrtc_from_session` accepts an app-owned endpoint response in the
+browser. They validate client ID, protocol, selected endpoint and expiry before
+connecting. A present malformed secure envelope never falls back to unsecure;
+supplying authentication fields also forbids fallback even when the option's
+boolean is false. Address overrides must match the token's exact endpoint.
+Parsing a public token is not server authentication; renetcode checks its
+private authenticated data during the handshake.
+
+Terminate HTTPS at the service or its trusted reverse proxy when issuing tokens
+and forwarding credentials outside local development. The supplied Axum router
+is an HTTP router and does not install TLS. Set `public_http_base` to the public
+HTTPS origin; SDP tokens and connect tokens are bearer credentials. Diagnostic
+formatting and HTTP errors omit credential/token contents. Existing empty-body
+helpers plus `UnsecureDevAuthPolicy` remain available for explicit local tests;
+they reject any request that asks for authenticated/secure admission.
+
+`BootstrapLimits` independently caps pending sessions (default 1,024), active
+sessions (256), and retained admission replay keys (8,192).
+`BootstrapService::with_limits` configures these caps. Run `cleanup_sessions`
+regularly and notify disconnections; active entries are not automatically
+removed just because an admission token expires. Request JSON is capped at
+8 KiB, credential text at 4 KiB, session response JSON at 16 KiB and SDP JSON at
+64 KiB. Native and browser clients read response bodies with bounded accumulation.
+Axum enforces body limits before JSON extraction; app-owned HTTP endpoints must
+apply the same limits. No unbounded application ticket cache or custom crypto is
+introduced.
 
 ## Browser configuration and local limits
 
@@ -297,7 +387,9 @@ Licensed under either the [MIT License](LICENSE-MIT) or the
 
 ## Transport send cadence
 
-Use unmodified upstream `renet` 2.0.0. Call `send_packets` once per application
+The default Renet profile preserves upstream 2.0.0 packetization. This checkout
+also supports [bounded packet profiles](docs/packet-budgets.md) through the owned
+Renet fork. Call `send_packets` once per application
 frame or regular network tick; the [upstream README example](https://github.com/lucaspoffo/renet#usage)
 uses approximately 60 Hz, and `bevy_renet` flushes in `PostUpdate`. This transport does not impose a
 send timer. If a headless loop polls sockets more frequently, schedule Renet packet

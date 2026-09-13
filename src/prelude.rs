@@ -3,6 +3,10 @@ pub use crate::{
     MonotonicClientIdAllocator, SessionAuthPolicy, SessionCreateResponse, SessionIdAllocator,
     UnsecureDevAuthPolicy,
 };
+pub use crate::{
+    BootstrapLimits, SecureSessionAuthPolicy, SessionAdmission, SessionCreateRequest, SessionGrant,
+    SessionIssuance, SessionSecurity, SessionSecurityError, SessionTransport,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use crate::{
@@ -11,6 +15,7 @@ pub use crate::{
     SdpHttpHookConfig, SdpHttpHookError, SdpHttpOfferRequest, ServerNetworkSnapshot, ServerPeer,
     TransportKind, UdpNetcodeClientTransport, UdpNetcodeServerTransport,
     WebRtcNetcodeServerTransport, accept_offer_and_add_peer, collect_server_network_snapshot,
+    connect_from_session,
 };
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "axum"))]
@@ -26,6 +31,7 @@ pub use crate::connect_via_session_http_async;
 pub use crate::{
     WebRtcClientError, WebRtcNetcodeClientTransport, connect_via_sdp_http,
     connect_via_sdp_http_with_options, connect_via_sdp_http_with_overrides,
+    connect_webrtc_from_session,
 };
 
 pub use crate::{
@@ -47,3 +53,5 @@ pub use crate::{
         ServerConditionerConfig, ServerConditionerHandle, ServerConditionerStats, ServerPeerId,
     },
 };
+
+pub use crate::{EgressBasis, EgressConfig, EgressConfigError, EgressStats};

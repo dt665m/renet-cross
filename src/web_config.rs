@@ -15,6 +15,8 @@ pub struct WebRtcConnectOptions {
     pub override_webrtc_addr: Option<String>,
     pub connection_config: ConnectionConfig,
     pub transport: crate::ClientTransportConfig,
+    pub session_request: crate::SessionCreateRequest,
+    pub require_secure: bool,
     pub ice_servers: Vec<WebRtcIceServer>,
     /// Maximum bytes queued in the browser's outgoing DataChannel buffer.
     /// Packets exceeding this budget are dropped; Renet owns retransmission.
@@ -31,6 +33,8 @@ impl Default for WebRtcConnectOptions {
             override_webrtc_addr: None,
             connection_config: ConnectionConfig::default(),
             transport: Default::default(),
+            session_request: Default::default(),
+            require_secure: false,
             ice_servers: vec![WebRtcIceServer {
                 urls: vec![
                     "stun:stun.l.google.com:19302".into(),

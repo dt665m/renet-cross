@@ -18,6 +18,12 @@ struct Harness {
     channel: ChannelId,
     channel_open: bool,
     now: Instant,
+    maximum_logical_sent: usize,
+    maximum_logical_received: usize,
+    allow_backpressure: bool,
+    drop_first_keepalive: bool,
+    lost_keepalives: usize,
+    unconfirmed_payloads: usize,
 }
 
 impl Harness {
@@ -72,6 +78,12 @@ impl Harness {
             channel,
             channel_open: false,
             now,
+            maximum_logical_sent: 0,
+            maximum_logical_received: 0,
+            allow_backpressure: false,
+            drop_first_keepalive: false,
+            lost_keepalives: 0,
+            unconfirmed_payloads: 0,
         }
     }
 
@@ -88,6 +100,22 @@ impl Harness {
                     self.channel_open = true
                 }
                 Output::Event(Event::ChannelData(mut data)) => {
+                    // Drop the encrypted netcode message after real
+                    // ICE/DTLS/SCTP delivery, before the client consumes it.
+                    if self.drop_first_keepalive
+                        && data.data.first().is_some_and(|prefix| prefix & 0x0f == 4)
+                    {
+                        self.drop_first_keepalive = false;
+                        self.lost_keepalives += 1;
+                        continue;
+                    }
+                    if data.data.first().is_some_and(|prefix| prefix & 0x0f == 5) {
+                        self.maximum_logical_received =
+                            self.maximum_logical_received.max(data.data.len());
+                        if !self.netcode.is_connected() {
+                            self.unconfirmed_payloads += 1;
+                        }
+                    }
                     if let Some(payload) = self.netcode.process_packet(&mut data.data) {
                         self.client.process_packet(payload);
                     }
@@ -100,7 +128,19 @@ impl Harness {
 
     fn write(&mut self, packet: &[u8]) {
         if let Some(mut channel) = self.rtc.channel(self.channel) {
-            assert!(channel.write(true, packet).unwrap());
+            let accepted = channel.write(true, packet).unwrap();
+            if accepted {
+                if packet.first().is_some_and(|prefix| prefix & 0x0f == 5) {
+                    self.maximum_logical_sent = self.maximum_logical_sent.max(packet.len());
+                }
+            } else {
+                // Production drops a rejected transport packet and lets Renet's
+                // reliable channel retry; the stress fixture models that path.
+                assert!(
+                    self.allow_backpressure,
+                    "unexpected datachannel backpressure"
+                );
+            }
             self.drain_client();
         }
     }
@@ -161,6 +201,54 @@ impl Harness {
         }
         panic!("connection failed after five simulated seconds");
     }
+}
+
+#[test]
+fn lost_initial_keepalive_recovers_during_continuous_payloads() {
+    let mut harness = Harness::new(42, 42);
+    harness.drop_first_keepalive = true;
+    let mut received = false;
+    let mut replied = false;
+    for _ in 0..200 {
+        if harness.server.is_connected(42) {
+            harness
+                .server
+                .send_message(42, DefaultChannel::Unreliable, vec![7; 32]);
+        }
+        harness.step();
+        if harness
+            .client
+            .receive_message(DefaultChannel::Unreliable)
+            .is_some()
+        {
+            received = true;
+            harness
+                .client
+                .send_message(DefaultChannel::ReliableOrdered, vec![9; 8]);
+        }
+        if harness
+            .server
+            .receive_message(42, DefaultChannel::ReliableOrdered)
+            .is_some()
+        {
+            replied = true;
+            break;
+        }
+    }
+    assert_eq!(harness.lost_keepalives, 1);
+    assert!(
+        harness.unconfirmed_payloads > 0,
+        "application payloads must reach the client before its confirmation retry"
+    );
+    assert!(
+        harness.client.is_connected(),
+        "payloads must not suppress confirmation retries"
+    );
+    assert!(
+        received,
+        "application traffic must resume after confirmation"
+    );
+    assert!(replied, "authenticated bidirectional traffic must resume");
 }
 
 #[test]
@@ -712,4 +800,71 @@ mod conditioning {
                 .is_none()
         );
     }
+}
+
+#[test]
+fn default_webrtc_logical_messages_roundtrip_without_claiming_browser_udp_limits() {
+    let mut h = Harness::new(42, 42);
+    h.allow_backpressure = true;
+    h.connect();
+    let expected = (0..16_u8)
+        .flat_map(|id| {
+            [40, 594, 1100, 16384]
+                .into_iter()
+                .map(move |size| vec![id; size])
+        })
+        .collect::<Vec<_>>();
+    for message in &expected {
+        h.client
+            .send_message(DefaultChannel::ReliableOrdered, message.clone());
+        h.server
+            .send_message(42, DefaultChannel::ReliableOrdered, message.clone());
+    }
+    let mut client = Vec::new();
+    let mut server = Vec::new();
+    for _ in 0..1000 {
+        h.step();
+        while let Some(value) = h.client.receive_message(DefaultChannel::ReliableOrdered) {
+            client.push(value.to_vec());
+        }
+        while let Some(value) = h
+            .server
+            .receive_message(42, DefaultChannel::ReliableOrdered)
+        {
+            server.push(value.to_vec());
+        }
+        assert!(h.maximum_logical_sent <= renetcode::NETCODE_MAX_PACKET_BYTES);
+        assert!(h.maximum_logical_received <= renetcode::NETCODE_MAX_PACKET_BYTES);
+        if client.len() == expected.len() && server.len() == expected.len() {
+            break;
+        }
+    }
+    assert_eq!(client, expected);
+    assert_eq!(server, expected);
+    assert!(h.maximum_logical_sent > 1100 && h.maximum_logical_received > 1100);
+}
+
+#[test]
+fn web_rtc_egress_paces_encrypted_messages_without_claiming_physical_bytes() {
+    let mut h = Harness::new(42, 42);
+    let config =
+        crate::EgressConfig::new(crate::EgressBasis::EncryptedLogical, 1000, 4096, 512).unwrap();
+    h.transport.set_egress_limit(Some(config)).unwrap();
+    let start = Instant::now();
+    h.connect();
+    for _ in 0..64 {
+        h.server
+            .send_message(42, DefaultChannel::ReliableOrdered, vec![7; 900]);
+    }
+    h.transport.send_packets(&mut h.server);
+    let stats = h.transport.egress_stats();
+    assert_eq!(stats.basis, crate::EgressBasis::EncryptedLogical);
+    assert!(stats.sent_packets > 0 && stats.control_packets > 0);
+    assert!(stats.pacing_drops > 0);
+    assert_eq!(stats.native_udp_ip_bytes, 0);
+    assert_eq!(stats.deferred_packets, 0);
+    assert!(
+        stats.encrypted_logical_bytes <= 4096 + (1000.0 * start.elapsed().as_secs_f64()) as u64
+    );
+    assert_eq!(h.transport.peer_egress_stats(42).unwrap(), stats);
 }

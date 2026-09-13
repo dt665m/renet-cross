@@ -1,6 +1,8 @@
 #[cfg(all(feature = "axum", not(target_arch = "wasm32")))]
 mod axum_bootstrap;
 mod bootstrap;
+mod session_security;
+pub use session_security::*;
 pub mod conditioner;
 #[cfg(not(target_arch = "wasm32"))]
 mod diagnostics;
@@ -33,7 +35,7 @@ mod web_config;
 #[cfg(all(feature = "axum", not(target_arch = "wasm32")))]
 pub use axum_bootstrap::{BootstrapAxumState, bootstrap_router};
 pub use bootstrap::{
-    BootstrapAuthError, BootstrapConfig, BootstrapError, InMemorySessionRegistry,
+    BootstrapAuthError, BootstrapConfig, BootstrapError, BootstrapLimits, InMemorySessionRegistry,
     MonotonicClientIdAllocator, SessionAuthPolicy, SessionCreateResponse, SessionIdAllocator,
     UnsecureDevAuthPolicy,
 };
@@ -52,7 +54,9 @@ pub use native_client::connect_via_session_http_async;
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-sync"))]
 pub use native_client::connect_via_session_http_blocking;
 #[cfg(not(target_arch = "wasm32"))]
-pub use native_client::{NativeClientError, NativeConnectOptions, UdpNetcodeClientTransport};
+pub use native_client::{
+    NativeClientError, NativeConnectOptions, UdpNetcodeClientTransport, connect_from_session,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use sdp_http::{
     SdpHttpAnswerResponse, SdpHttpHookConfig, SdpHttpHookError, SdpHttpOfferRequest,
@@ -68,6 +72,7 @@ pub use udp_server::UdpNetcodeServerTransport;
 pub use web_client::{
     WebRtcClientError, WebRtcNetcodeClientTransport, connect_via_sdp_http,
     connect_via_sdp_http_with_options, connect_via_sdp_http_with_overrides,
+    connect_webrtc_from_session,
 };
 pub use web_config::{
     WebRtcClientStats, WebRtcConnectOptions, WebRtcIceServer, WebRtcOptionsError,
@@ -89,3 +94,6 @@ mod transport_config;
 pub use transport_config::ClientTransportConfig;
 #[cfg(not(target_arch = "wasm32"))]
 pub use transport_config::ServerTransportConfig;
+
+mod egress;
+pub use egress::{EgressAllowance, EgressBasis, EgressConfig, EgressConfigError, EgressStats};

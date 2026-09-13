@@ -4,7 +4,7 @@ use gloo_net::http::Request;
 use gloo_timers::future::TimeoutFuture;
 use js_sys::{Array, ArrayBuffer, Reflect, Uint8Array};
 use renet::RenetClient;
-use renetcode::{ClientAuthentication, NetcodeClient, NetcodeError};
+use renetcode::{NetcodeClient, NetcodeError};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
@@ -24,6 +24,12 @@ const STATE_POLL_INTERVAL_MS: u32 = 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WebRtcClientError {
+    #[error(transparent)]
+    BootstrapAuth(#[from] crate::BootstrapAuthError),
+    #[error(transparent)]
+    Security(#[from] crate::SessionSecurityError),
+    #[error("bootstrap HTTP body exceeds its size limit")]
+    BodyTooLarge,
     #[error(transparent)]
     Options(#[from] WebRtcOptionsError),
     #[error("HTTP request to {url} failed: {detail}")]
@@ -76,6 +82,7 @@ struct SdpHttpAnswerResponse {
 }
 
 pub struct WebRtcNetcodeClientTransport {
+    egress: crate::egress::Egress<()>,
     _peer: PeerGuard,
     data_channel: RtcDataChannel,
     netcode_client: NetcodeClient,
@@ -102,6 +109,17 @@ impl Drop for WebRtcNetcodeClientTransport {
 }
 
 impl WebRtcNetcodeClientTransport {
+    /// Limits encrypted netcode messages, not browser-managed physical traffic.
+    pub fn set_egress_limit(
+        &mut self,
+        config: Option<crate::EgressConfig>,
+    ) -> Result<(), crate::EgressConfigError> {
+        self.egress.configure(config)
+    }
+    pub fn egress_stats(&self) -> crate::EgressStats {
+        self.egress.stats()
+    }
+
     /// Attach optional raw-packet conditioning before the first update to include
     /// the netcode handshake. ICE/DTLS/SCTP establishment happens before this API.
     /// Replacing a conditioner discards all locally pending packets.
@@ -140,7 +158,7 @@ impl WebRtcNetcodeClientTransport {
         self.flush_pending_sends()
     }
 
-    fn flush_pending_sends(&self) -> Result<(), WebRtcClientError> {
+    fn flush_pending_sends(&mut self) -> Result<(), WebRtcClientError> {
         for ((), packet) in self.packets.drain(Direction::Outgoing) {
             self.send_data_channel_packet_unconditioned(&packet)?;
         }
@@ -244,7 +262,7 @@ impl WebRtcNetcodeClientTransport {
         Ok(())
     }
 
-    fn send_data_channel_packet(&self, payload: &[u8]) -> Result<(), WebRtcClientError> {
+    fn send_data_channel_packet(&mut self, payload: &[u8]) -> Result<(), WebRtcClientError> {
         if !self.packets.defer(Direction::Outgoing, (), payload) {
             self.send_data_channel_packet_unconditioned(payload)?;
         }
@@ -252,9 +270,12 @@ impl WebRtcNetcodeClientTransport {
     }
 
     fn send_data_channel_packet_unconditioned(
-        &self,
+        &mut self,
         payload: &[u8],
     ) -> Result<(), WebRtcClientError> {
+        if !self.egress.admit((), payload, 0) {
+            return Ok(());
+        }
         match self.data_channel.ready_state() {
             RtcDataChannelState::Open => {
                 if !fits_send_budget(
@@ -263,16 +284,26 @@ impl WebRtcNetcodeClientTransport {
                     self.max_buffered_amount,
                 ) {
                     self.inbox.borrow_mut().stats.send_backpressure_drops += 1;
+                    self.egress.complete((), payload, 0, false);
                     return Ok(());
                 }
-                self.data_channel
+                let result = self
+                    .data_channel
                     .send_with_u8_array(payload)
-                    .map_err(js_error)
+                    .map_err(js_error);
+                self.egress.complete((), payload, 0, result.is_ok());
+                result
             }
-            RtcDataChannelState::Connecting => Ok(()),
-            state => Err(WebRtcClientError::DataChannelState {
-                state: data_channel_state_label(state),
-            }),
+            RtcDataChannelState::Connecting => {
+                self.egress.complete((), payload, 0, false);
+                Ok(())
+            }
+            state => {
+                self.egress.complete((), payload, 0, false);
+                Err(WebRtcClientError::DataChannelState {
+                    state: data_channel_state_label(state),
+                })
+            }
         }
     }
 }
@@ -296,7 +327,7 @@ pub async fn connect_via_sdp_http_with_overrides(
     connect_via_sdp_http_with_options(base_http, protocol_id, options).await
 }
 
-/// Bootstrap an unsecure netcode session with explicit browser transport policy.
+/// Bootstrap with explicit browser transport and secure-session requirements.
 /// ICE credentials configure TURN access, not game authentication.
 pub async fn connect_via_sdp_http_with_options(
     base_http: &str,
@@ -304,15 +335,49 @@ pub async fn connect_via_sdp_http_with_options(
     options: WebRtcConnectOptions,
 ) -> Result<(RenetClient, WebRtcNetcodeClientTransport, u64), WebRtcClientError> {
     options.validate()?;
-    log::info!("starting web session bootstrap against {base_http}");
-    let session = create_session(base_http).await?;
-    log::info!(
-        "web session response: client_id={} udp_addr={} webrtc_addr={} webrtc_offer_url={}",
-        session.client_id,
-        session.udp_addr,
-        session.webrtc_addr,
-        session.webrtc_offer_url
-    );
+    let mut request = options.session_request.clone();
+    request.require_secure |= options.require_secure;
+    if request.requests_authentication() {
+        if request.protocol_id.is_some_and(|p| p != protocol_id) {
+            return Err(crate::SessionSecurityError::BindingMismatch.into());
+        }
+        request.protocol_id = Some(protocol_id);
+    }
+    request.validate()?;
+    let session = create_session(base_http, &request).await?;
+    connect_webrtc_from_session(session, protocol_id, options).await
+}
+
+/// Connect from an app-owned authenticated bootstrap endpoint. Token selection
+/// and binding validation happen before allocating an RTC peer or posting SDP.
+pub async fn connect_webrtc_from_session(
+    session: SessionCreateResponse,
+    protocol_id: u64,
+    options: WebRtcConnectOptions,
+) -> Result<(RenetClient, WebRtcNetcodeClientTransport, u64), WebRtcClientError> {
+    options.validate()?;
+    let request = &options.session_request;
+    let selected_webrtc_addr = options
+        .override_webrtc_addr
+        .as_deref()
+        .filter(|addr| !addr.trim().is_empty())
+        .unwrap_or(&session.webrtc_addr);
+    let server_addr = selected_webrtc_addr.parse().map_err(|source| {
+        WebRtcClientError::InvalidSessionWebRtcAddr {
+            addr: "<invalid endpoint>".into(),
+            source,
+        }
+    })?;
+    // Parse now to fail before SDP allocation; parse again after negotiation so
+    // a slow ICE exchange cannot accidentally use a locally expired token.
+    session.authentication(
+        protocol_id,
+        server_addr,
+        crate::SessionTransport::WebRtc,
+        browser_now_duration(),
+        options.require_secure,
+        &request,
+    )?;
 
     let ice_servers = Array::new();
     for server in &options.ice_servers {
@@ -434,38 +499,21 @@ pub async fn connect_via_sdp_http_with_options(
         }
     }) as Box<dyn FnMut(MessageEvent)>);
 
-    let selected_webrtc_addr = options
-        .override_webrtc_addr
-        .as_deref()
-        .filter(|addr| !addr.trim().is_empty())
-        .unwrap_or(&session.webrtc_addr);
-    if selected_webrtc_addr != session.webrtc_addr {
-        log::info!(
-            "overriding session webrtc_addr '{}' with configured '{}'",
-            session.webrtc_addr,
-            selected_webrtc_addr
-        );
-    }
-
-    let server_addr = selected_webrtc_addr.parse().map_err(|source| {
-        WebRtcClientError::InvalidSessionWebRtcAddr {
-            addr: selected_webrtc_addr.to_owned(),
-            source,
-        }
-    })?;
-
-    let authentication = ClientAuthentication::Unsecure {
+    let authentication = session.authentication(
         protocol_id,
-        client_id: session.client_id,
         server_addr,
-        user_data: None,
-    };
+        crate::SessionTransport::WebRtc,
+        browser_now_duration(),
+        options.require_secure,
+        &request,
+    )?;
 
     let netcode_client = NetcodeClient::new(browser_now_duration(), authentication)?;
     let renet = RenetClient::new(options.connection_config);
 
     data_channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
     let transport = WebRtcNetcodeClientTransport {
+        egress: crate::egress::Egress::new(crate::EgressBasis::EncryptedLogical),
         _peer: peer_guard,
         data_channel,
         netcode_client,
@@ -478,19 +526,29 @@ pub async fn connect_via_sdp_http_with_options(
     Ok((renet, transport, answer.client_id))
 }
 
-async fn create_session(base_http: &str) -> Result<SessionCreateResponse, WebRtcClientError> {
+async fn create_session(
+    base_http: &str,
+    request: &crate::SessionCreateRequest,
+) -> Result<SessionCreateResponse, WebRtcClientError> {
     let url = format!("{}/api/session/new", base_http.trim_end_matches('/'));
     log::debug!("requesting web session: {url}");
-    let response =
-        Request::post(&url)
-            .send()
-            .await
-            .map_err(|err| WebRtcClientError::HttpRequest {
-                url: url.clone(),
-                detail: err.to_string(),
-            })?;
+    let body = serde_json::to_string(request).map_err(|_| WebRtcClientError::BodyTooLarge)?;
+    if body.len() > crate::MAX_SESSION_REQUEST_BYTES {
+        return Err(WebRtcClientError::BodyTooLarge);
+    }
+    let response = Request::post(&url)
+        .redirect(web_sys::RequestRedirect::Error)
+        .header("content-type", "application/json")
+        .body(body)
+        .map_err(|_| WebRtcClientError::BodyTooLarge)?
+        .send()
+        .await
+        .map_err(|err| WebRtcClientError::HttpRequest {
+            url: url.clone(),
+            detail: err.to_string(),
+        })?;
 
-    decode_json_response(response, &url).await
+    decode_json_response(response, &url, crate::MAX_SESSION_RESPONSE_BYTES).await
 }
 
 async fn post_offer(
@@ -498,17 +556,25 @@ async fn post_offer(
     sdp: String,
     session_token: Option<&str>,
 ) -> Result<SdpHttpAnswerResponse, WebRtcClientError> {
+    if sdp.len() > crate::MAX_SDP_BODY_BYTES
+        || session_token.is_some_and(|t| t.len() > crate::MAX_SESSION_TOKEN_BYTES)
+    {
+        return Err(WebRtcClientError::BodyTooLarge);
+    }
     log::debug!("posting SDP offer to {url}");
     let request = SdpHttpOfferRequest {
         sdp,
         session_token: session_token.map(str::to_string),
     };
+    let body = serde_json::to_string(&request).map_err(|_| WebRtcClientError::BodyTooLarge)?;
+    if body.len() > crate::MAX_SDP_BODY_BYTES {
+        return Err(WebRtcClientError::BodyTooLarge);
+    }
     let response = Request::post(url)
-        .json(&request)
-        .map_err(|err| WebRtcClientError::HttpRequest {
-            url: url.to_string(),
-            detail: err.to_string(),
-        })?
+        .redirect(web_sys::RequestRedirect::Error)
+        .header("content-type", "application/json")
+        .body(body)
+        .map_err(|_| WebRtcClientError::BodyTooLarge)?
         .send()
         .await
         .map_err(|err| WebRtcClientError::HttpRequest {
@@ -516,33 +582,56 @@ async fn post_offer(
             detail: err.to_string(),
         })?;
 
-    decode_json_response(response, url).await
+    decode_json_response(response, url, crate::MAX_SDP_BODY_BYTES).await
 }
 
 async fn decode_json_response<T: serde::de::DeserializeOwned>(
     response: gloo_net::http::Response,
     url: &str,
+    limit: usize,
 ) -> Result<T, WebRtcClientError> {
     if !response.ok() {
-        let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<failed to read response body>".to_string());
         return Err(WebRtcClientError::HttpStatus {
             url: url.to_string(),
-            status,
-            body,
+            status: response.status(),
+            body: "bootstrap request rejected".into(),
         });
     }
-
-    response
-        .json::<T>()
-        .await
-        .map_err(|err| WebRtcClientError::HttpDecode {
-            url: url.to_string(),
-            detail: err.to_string(),
-        })
+    let stream = response
+        .body()
+        .ok_or_else(|| WebRtcClientError::HttpDecode {
+            url: url.into(),
+            detail: "missing response body".into(),
+        })?;
+    let reader: web_sys::ReadableStreamDefaultReader = stream
+        .get_reader()
+        .dyn_into()
+        .map_err(|value: js_sys::Object| js_error(value.into()))?;
+    let mut bytes = Vec::new();
+    loop {
+        let item = JsFuture::from(reader.read()).await.map_err(js_error)?;
+        if Reflect::get(&item, &JsValue::from_str("done"))
+            .map_err(js_error)?
+            .as_bool()
+            == Some(true)
+        {
+            break;
+        }
+        let value = Reflect::get(&item, &JsValue::from_str("value")).map_err(js_error)?;
+        let chunk = Uint8Array::new(&value);
+        if chunk.length() as usize > limit - bytes.len() {
+            let _ = JsFuture::from(reader.cancel()).await;
+            return Err(WebRtcClientError::BodyTooLarge);
+        }
+        let previous = bytes.len();
+        bytes.resize(previous + chunk.length() as usize, 0);
+        chunk.copy_to(&mut bytes[previous..]);
+    }
+    reader.release_lock();
+    serde_json::from_slice(&bytes).map_err(|_| WebRtcClientError::HttpDecode {
+        url: url.into(),
+        detail: "invalid bootstrap JSON".into(),
+    })
 }
 
 async fn await_ice_complete(peer: &RtcPeerConnection) -> Result<(), WebRtcClientError> {

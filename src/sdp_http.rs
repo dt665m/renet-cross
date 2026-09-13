@@ -19,13 +19,20 @@ impl SdpHttpHookConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct SdpHttpOfferRequest {
     pub sdp: String,
     #[serde(default)]
     pub session_token: Option<String>,
 }
 
+impl std::fmt::Debug for SdpHttpOfferRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SdpHttpOfferRequest")
+            .field("sdp_bytes", &self.sdp.len())
+            .finish_non_exhaustive()
+    }
+}
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SdpHttpAnswerResponse {
     pub client_id: ClientId,
@@ -52,6 +59,16 @@ pub fn accept_offer_and_add_peer(
     offer: SdpHttpOfferRequest,
     config: SdpHttpHookConfig,
 ) -> Result<SdpHttpAnswerResponse, SdpHttpHookError> {
+    if offer.sdp.len() > crate::MAX_SDP_BODY_BYTES
+        || offer
+            .session_token
+            .as_ref()
+            .is_some_and(|t| t.len() > crate::MAX_SESSION_TOKEN_BYTES)
+    {
+        return Err(SdpHttpHookError::InvalidOffer {
+            message: "offer exceeds size limit".into(),
+        });
+    }
     if transport.peer(client_id).is_some() {
         return Err(SdpHttpHookError::DuplicateClientId { client_id });
     }
@@ -73,12 +90,17 @@ pub fn accept_offer_and_add_peer(
     rtc.add_local_candidate(candidate);
 
     let answer = rtc.sdp_api().accept_offer(offer)?;
-    transport.add_peer(client_id, rtc);
-
-    Ok(SdpHttpAnswerResponse {
+    let response = SdpHttpAnswerResponse {
         client_id,
         sdp: answer.to_sdp_string(),
-    })
+    };
+    if serde_json::to_vec(&response).map_or(true, |bytes| bytes.len() > crate::MAX_SDP_BODY_BYTES) {
+        return Err(SdpHttpHookError::InvalidOffer {
+            message: "answer exceeds size limit".into(),
+        });
+    }
+    transport.add_peer(client_id, rtc);
+    Ok(response)
 }
 
 #[cfg(feature = "axum")]

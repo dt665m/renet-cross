@@ -204,6 +204,16 @@ impl ServerConditionerHandle {
             state.retire(id);
         }
     }
+    pub(crate) fn queued_outgoing(&self, owner: u64, id: ServerPeerId) -> DirectionStats {
+        self.state
+            .lock()
+            .unwrap()
+            .peers
+            .get(&id)
+            .filter(|peer| peer.owner == owner)
+            .map(|peer| peer.engine.handle().stats().outgoing)
+            .unwrap_or_default()
+    }
     pub(crate) fn defer_at(
         &self,
         owner: u64,
@@ -386,6 +396,46 @@ mod tests {
     }
     fn udp(id: u16) -> ServerPeerId {
         ServerPeerId::Udp(([127, 0, 0, 1], id).into())
+    }
+    #[test]
+    fn delayed_outgoing_packets_reserve_credit_until_release_without_cross_peer_charging() {
+        let mut config = config();
+        config.packets.max_queue_packets = 8;
+        let handle = ServerConditionerHandle::new(config).unwrap();
+        let owner = handle.allocate_owner();
+        for (time, bytes) in [(0, 1000), (20, 1000), (40, 500)] {
+            assert!(handle.defer_at(owner, Outgoing, udp(1), &vec![5; bytes], ms(time)));
+        }
+        assert!(handle.defer_at(owner, Incoming, udp(1), &[5; 600], ms(40)));
+        assert!(handle.defer_at(owner, Outgoing, udp(2), &[5; 700], ms(40)));
+        let queue = handle.queued_outgoing(owner, udp(1));
+        assert_eq!((queue.queued_bytes, queue.queued_packets), (2500, 3));
+        assert_eq!(handle.queued_outgoing(owner + 1, udp(1)).queued_bytes, 0);
+        for overhead in [0, 28, 48] {
+            let mut allowance = crate::EgressAllowance {
+                basis: if overhead == 0 {
+                    crate::EgressBasis::EncryptedLogical
+                } else {
+                    crate::EgressBasis::NativeUdpIp
+                },
+                config: None,
+                available_data_bytes: 3600,
+                maximum_data_bytes: 3600,
+                ip_udp_overhead: overhead,
+            };
+            allowance.reserve_queued(queue.queued_bytes, queue.queued_packets);
+            assert_eq!(allowance.available_data_bytes, 1100 - 3 * overhead);
+            assert_eq!(allowance.maximum_data_bytes, 3600);
+        }
+        assert!(handle.drain_at(owner, Outgoing, ms(99)).is_empty());
+        assert_eq!(handle.drain_at(owner, Outgoing, ms(100)).len(), 1);
+        let queue = handle.queued_outgoing(owner, udp(1));
+        assert_eq!((queue.queued_bytes, queue.queued_packets), (1500, 2));
+        // Once released, these packets are charged by Egress::admit; their queue
+        // reservation disappears. No packet is charged to another peer/direction.
+        assert_eq!(handle.drain_at(owner, Outgoing, ms(140)).len(), 3);
+        assert_eq!(handle.queued_outgoing(owner, udp(1)).queued_bytes, 0);
+        assert_eq!(handle.per_peer_stats()[&udp(1)].incoming.queued_bytes, 600);
     }
     #[test]
     fn peers_and_directions_have_independent_queues() {

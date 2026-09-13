@@ -4,7 +4,7 @@ Optional Bevy 0.19.1 debug panel for `renet-cross` client packet conditioning. T
 
 ```toml
 [dependencies]
-renet-cross = "0.6"
+renet-cross = "0.7"
 bevy-net-debug = "0.2"
 ```
 

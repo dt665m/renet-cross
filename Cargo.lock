@@ -5636,9 +5636,10 @@ dependencies = [
 
 [[package]]
 name = "renet-cross"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "axum",
+ "base64",
  "getrandom 0.2.17",
  "gloo-net",
  "gloo-timers",
@@ -5650,6 +5651,7 @@ dependencies = [
  "serde",
  "serde_json",
  "str0m",
+ "subtle",
  "thiserror 2.0.20",
  "tokio",
  "tower",
@@ -5661,8 +5663,7 @@ dependencies = [
 [[package]]
 name = "renetcode"
 version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76bed9d6d190d20804b5645511932fef803145520ef4eb76d5e4b5a841980eac"
+source = "git+https://github.com/dt665m/renet.git?branch=fix%2Fconfirmation-keepalive-starvation#af8d58971b3dbf4fa6832807504851170e9231d3"
 dependencies = [
  "chacha20poly1305",
  "log",

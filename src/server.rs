@@ -77,6 +77,7 @@ impl ServerPeer {
 
 #[derive(Debug)]
 pub struct WebRtcNetcodeServerTransport {
+    egress: crate::egress::Egress<ClientId>,
     socket: UdpSocket,
     netcode_server: NetcodeServer,
     receive_destination: SocketAddr,
@@ -125,6 +126,7 @@ impl WebRtcNetcodeServerTransport {
             packet_gate.attach(handle);
         }
         Ok(Self {
+            egress: crate::egress::Egress::new(crate::EgressBasis::EncryptedLogical),
             socket,
             netcode_server,
             receive_destination,
@@ -136,6 +138,31 @@ impl WebRtcNetcodeServerTransport {
             send_payload_scratch: Vec::with_capacity(NETCODE_MAX_PACKET_BYTES),
             buffer: [0; WEBRTC_RECV_BUFFER_BYTES],
             packet_gate,
+        })
+    }
+
+    /// Limits encrypted netcode messages; ICE/DTLS/SCTP wire bytes are excluded.
+    pub fn set_egress_limit(
+        &mut self,
+        config: Option<crate::EgressConfig>,
+    ) -> Result<(), crate::EgressConfigError> {
+        self.egress.configure(config)
+    }
+    pub fn egress_stats(&self) -> crate::EgressStats {
+        self.egress.stats()
+    }
+    pub fn peer_egress_stats(&self, client_id: ClientId) -> Option<crate::EgressStats> {
+        self.egress.peer_stats(client_id)
+    }
+
+    pub fn peer_egress_allowance(&self, client_id: ClientId) -> Option<crate::EgressAllowance> {
+        self.peers.contains_key(&client_id).then(|| {
+            let mut allowance = self.egress.peer_allowance(client_id);
+            let queued = self
+                .packet_gate
+                .queued_outgoing(ServerPeerId::WebRtc(client_id));
+            allowance.reserve_queued(queued.queued_bytes, queued.queued_packets);
+            allowance
         })
     }
 
@@ -299,10 +326,6 @@ impl WebRtcNetcodeServerTransport {
                     continue;
                 }
             };
-
-            if packets.is_empty() {
-                continue;
-            }
 
             for packet in packets {
                 match self
@@ -620,7 +643,7 @@ impl WebRtcNetcodeServerTransport {
             } => {
                 if server.is_connected(client_id) {
                     log::error!(
-                        "Duplicate client_id {client_id} across transports. Rejecting new WebRTC connection."
+                        "Duplicate identity for client {client_id}. Rejecting new WebRTC connection."
                     );
                     let disconnect = self.netcode_server.disconnect(client_id);
                     if let OwnedServerResult::ClientDisconnected {
@@ -685,6 +708,19 @@ impl WebRtcNetcodeServerTransport {
     }
 
     fn send_to_peer_unconditioned(
+        &mut self,
+        client_id: ClientId,
+        payload: &[u8],
+    ) -> Result<(), TransportError> {
+        if !self.egress.admit(client_id, payload, 0) {
+            return Ok(());
+        }
+        let result = self.send_to_peer_backend(client_id, payload);
+        self.egress.complete(client_id, payload, 0, result.is_ok());
+        result
+    }
+
+    fn send_to_peer_backend(
         &mut self,
         client_id: ClientId,
         payload: &[u8],
